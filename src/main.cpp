@@ -65,7 +65,7 @@ void usage() {
         "  --draft N           draft tokens per step (default 3; 0 = off). 3 gives verify batches of 4, which\n"
         "                      the repacked AVX2 kernels process in one pass\n"
         "  --mtp-window N      MTP attention window in positions (default 16384)\n"
-        "  --snap-type T       DeltaNet rollback snapshots: bf16 (default) or f32\n"
+        "  --snap-type T       DeltaNet rollback snapshots: f16 (default), bf16 or f32\n"
         "\n"
         "run / check-spec:\n"
         "  -p TEXT | -f FILE   prompt\n"

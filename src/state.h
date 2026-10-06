@@ -17,7 +17,7 @@ struct StateConfig {
     ggml_type type_v = GGML_TYPE_Q8_0;
     Place kv_place = Place::Gpu;
     int n_snapshots = 1;      // recurrent state slots: 1 + max draft tokens (for rollback after rejected drafts)
-    ggml_type snap_type = GGML_TYPE_BF16;  // storage of the rollback snapshots (slots 1..); slot 0 is always f32
+    ggml_type snap_type = GGML_TYPE_F16;  // storage of the rollback snapshots (slots 1..); slot 0 is always f32
     int max_batch = 512;      // largest batch a forward pass takes (bounds the hidden-state buffer)
     int mtp_window = 16384;   // MTP head attention window (ring buffer cells, kept in VRAM)
 };

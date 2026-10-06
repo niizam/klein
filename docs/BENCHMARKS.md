@@ -173,3 +173,47 @@ klein check-spec -m MODEL -c 8192 -n 300 -p "Explain how a hash table handles co
 
 (`novel.txt` = klein's own docs and sources, text the model has never seen. Note that llama.cpp reads `-f` files in
 text mode on Windows, converting CRLF to LF; compare on the token ids stored in the base file, as `--kld-base` does.)
+
+## Quantization: speed vs quality
+
+Unsloth's `UD-IQ3_XXS` (10.18 GiB) fits in VRAM almost entirely (only `token_embd`, which is just looked up, stays
+in RAM), so decoding no longer waits on the CPU. `klein bench -m Qwen3.8-27B-UD-IQ3_XXS.gguf`, 262K context:
+
+| Prompt | Prefill | Decode | Verify step | IQ4_XS decode |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 1,049 tok/s | 49.96 tok/s | 61.5 ms | 19.66 tok/s |
+| 4,096 | 1,123 tok/s | 48.80 tok/s | 61.1 ms | 20.52 tok/s |
+| 32,768 | 930 tok/s | 30.51 tok/s | 92.6 ms | 18.98 tok/s |
+
+At 32K the KV cache (in RAM, read over PCIe) becomes the main cost of a step.
+
+Quality against the most precise quant available, `UD-Q4_K_S` (14.30 GiB), on 4,080 tokens of text the model has
+never seen (klein's own docs and sources, 16 chunks of 512):
+
+| Quant | Size | Mean KLD vs Q4_K_S | Same top token | Perplexity |
+| --- | ---: | ---: | ---: | ---: |
+| UD-Q4_K_S (reference) | 14.30 GiB | - | - | 5.562 |
+| UD-IQ4_XS (default) | 13.27 GiB | 0.0172 | 92.60% | 5.578 (+0.3%) |
+| UD-IQ3_XXS | 10.18 GiB | 0.0800 | 85.64% | 5.773 (+3.8%) |
+
+```
+llama-perplexity -m Qwen3.8-27B-UD-Q4_K_S.gguf -f novel_big.txt -c 512 --chunks 16 -ngl 99 -fa on -t 12 \
+  -ot "<33 FFN blocks>=CPU" --kl-divergence-base kld_q4ks.bin
+klein ppl -m Qwen3.8-27B-UD-IQ4_XS.gguf  --kld-base kld_q4ks.bin --ppl-batch 512 --kv f16
+klein ppl -m Qwen3.8-27B-UD-IQ3_XXS.gguf --kld-base kld_q4ks.bin --ppl-batch 512 --kv f16
+```
+
+IQ3_XXS writes answers ~2.4x faster at a clearly measurable quality cost (4.6x the divergence of IQ4_XS); which
+one to run is the user's call (`-m`).
+
+## Rollback snapshot precision
+
+`check-spec` (300 greedy tokens, IQ4_XS, 8K context), positions that differ from plain decoding:
+
+| Snapshots | Differing positions | Worst logit margin |
+| --- | ---: | ---: |
+| f32 | 1 | 0.027 |
+| bf16 | 1 | 0.067 |
+| f16 (default) | 1 | 0.0096 |
+
+f16 and bf16 take the same VRAM; f16 keeps 10 mantissa bits to bf16's 7 (as HyperQwen notes for this model's state).

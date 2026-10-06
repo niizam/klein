@@ -40,7 +40,7 @@ Only the 16 full-attention layers keep a KV cache. The 48 DeltaNet layers keep a
 | LM head `output` (Q5_K) | 0.81 GiB | VRAM: read by every target and every draft step |
 | MTP layer | 0.36 GiB | VRAM |
 | Decoder trunk | 11.58 GiB | VRAM, except whole FFN blocks the planner spills (3.4-3.8 GiB) |
-| Recurrent state | 144 MiB f32 + 3 bf16 rollback snapshots (216 MiB) | VRAM |
+| Recurrent state | 144 MiB f32 + 3 f16 rollback snapshots (216 MiB) | VRAM |
 | KV cache | 18 KiB/token at q4_0 (4.5 GiB at 262,144) | RAM when large (pinned, GPU-mapped) |
 
 About 10.8 GiB of VRAM is free on the reference machine with the Windows desktop running, so at least ~2.5 GiB of
@@ -109,7 +109,7 @@ Qwen3.8 ships one MTP layer. Each step:
 
 Details that matter:
 - **Snapshots.** ggml's fused `gated_delta_net` op emits the state after each of the last K tokens. klein keeps the
-  current state in f32 and the older ones in **bf16** (half the VRAM). Rollback copies a snapshot back, about 0.5
+  current state in f32 and the older ones in **f16** (half the VRAM; f16's 10-bit mantissa measured more exact than bf16). Rollback copies a snapshot back, about 0.5
   ms.
 - **MTP ring cache.** The MTP head attends over a 16,384-position **sliding window** stored as a ring buffer in
   VRAM. Draft cost no longer grows with the context (39 -> 4.6 ms per step at 32K). Drafts only need to be

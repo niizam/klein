@@ -51,7 +51,7 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     pin.state.n_snapshots = (model_->has_mtp() ? cfg.n_draft : 0) + 1;
     pin.state.max_batch = std::max(cfg.n_ubatch, cfg.n_draft + 1);
     pin.state.mtp_window = std::max(cfg.mtp_window, 2 * pin.state.max_batch);
-    pin.state.snap_type = cfg.snap_type == "f32" ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+    pin.state.snap_type = cfg.snap_type == "f32" ? GGML_TYPE_F32 : cfg.snap_type == "bf16" ? GGML_TYPE_BF16 : GGML_TYPE_F16;
     pin.verify_batch = (model_->has_mtp() ? cfg.n_draft : 0) + 1;
     const std::string kvt = cfg.kv_type == "auto" ? (pin.state.n_ctx > 131072 ? "q4_0" : "q8_0") : cfg.kv_type;
     pin.state.type_k = pin.state.type_v = parse_kv_type(kvt);
