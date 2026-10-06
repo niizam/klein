@@ -6,6 +6,7 @@
 //   klein run   -m model.gguf -p "prompt"          chat completion printed to stdout
 //   klein bench -m model.gguf [-pp 512] [-n 128]   prefill and decode speed
 //   klein ppl   -m model.gguf -f text.txt [-c 512] perplexity (same scoring as llama.cpp's llama-perplexity)
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -272,6 +273,47 @@ int cmd_ppl(Args& a) {
     return 0;
 }
 
+// Speculative decoding must emit exactly what the model would emit one token at a time (at temperature 0), up to
+// numerical noise between batch shapes. Generate with drafts, then replay the tokens without speculation and
+// report every position where the emitted token is not the plain model's top choice, with the logit margin.
+int cmd_check_spec(Args& a) {
+    Engine eng(a.ec);
+    std::string text = a.file.empty() ? a.prompt : read_file(a.file);
+    if (!a.raw) text = chat_prompt(text, a.think);
+    const auto prompt = eng.tokenizer().encode(text, true);
+    SamplerParams sp;
+    sp.temperature = 0.0f;
+    Sampler smp(sp);
+    std::vector<int32_t> gen;
+    const auto st = eng.generate(prompt, a.n_predict, smp, [&](int32_t t) {
+        gen.push_back(t);
+        return true;
+    });
+    std::fprintf(stderr, "generated %zu tokens with drafts (%d steps, %d/%d drafts accepted)\n", gen.size(), st.n_steps, st.n_accepted, st.n_drafted);
+
+    eng.reset();
+    std::vector<float> logits;
+    eng.eval(prompt.data(), (int) prompt.size(), 1, &logits);
+    const int nv = eng.n_vocab();
+    int mism = 0, bad = 0;
+    double worst = 0.0;
+    for (size_t i = 0; i < gen.size(); ++i) {
+        const float* l = logits.data();
+        const int top = (int) (std::max_element(l, l + nv) - l);
+        if (top != gen[i]) {
+            const double margin = (double) l[top] - l[gen[i]];
+            ++mism;
+            worst = std::max(worst, margin);
+            if (margin > 0.5) ++bad;
+            std::printf("pos %zu: emitted %d, plain top %d, margin %.4f\n", i, gen[i], top, margin);
+        }
+        eng.eval(&gen[i], 1, 1, &logits);
+    }
+    std::printf("check-spec: %zu tokens, %d differ from the plain top-1 (worst margin %.4f), %d with margin > 0.5 -> %s\n", gen.size(),
+                mism, worst, bad, bad == 0 ? "OK (numerical near-ties only)" : "SUSPICIOUS");
+    return bad == 0 ? 0 : 2;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -279,6 +321,7 @@ int main(int argc, char** argv) {
     if (a.cmd == "run") return cmd_run(a);
     if (a.cmd == "bench") return cmd_bench(a);
     if (a.cmd == "ppl") return cmd_ppl(a);
+    if (a.cmd == "check-spec") return cmd_check_spec(a);
     if (a.cmd == "serve") {
         Engine eng(a.ec);
         return run_server(eng, a.so);

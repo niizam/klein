@@ -23,7 +23,7 @@ struct EngineConfig {
     int n_ctx = 262144;
     std::string kv_type = "auto";  // auto | f16 | q8_0 | q4_0
     std::string kv_place = "auto"; // auto | gpu | host
-    int n_threads = 8;
+    int n_threads = 0;             // 0 = 3/4 of the hardware threads (12 on an 8-core/16-thread CPU, measured best)
     int n_ubatch = 2048;           // prefill chunk
     int n_draft = 3;               // MTP draft tokens per step (0 = no speculation)
     size_t vram_margin_mb = 256;

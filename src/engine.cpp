@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <thread>
 
 #include "common.h"
 #include "ggml-cpu.h"
@@ -28,7 +29,8 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     gpu_ = ggml_backend_cuda_init(0);
     if (!gpu_) fatal("no CUDA device");
     cpu_ = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(cpu_, cfg.n_threads);
+    if (cfg_.n_threads <= 0) cfg_.n_threads = std::max(1, (int) std::thread::hardware_concurrency() * 3 / 4);
+    ggml_backend_cpu_set_n_threads(cpu_, cfg_.n_threads);
 
     ModelOptions mo;
     mo.path = cfg.model_path;
