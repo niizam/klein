@@ -1,0 +1,526 @@
+[
+  {
+    "name": "single_user",
+    "messages": [{ "role": "user", "content": "Hello, world!" }],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "single_user_no_generation_prompt",
+    "messages": [{ "role": "user", "content": "Hello, world!" }],
+    "tools": null,
+    "options": { "add_generation_prompt": false, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "system_and_user",
+    "messages": [
+      { "role": "system", "content": "You are a helpful assistant." },
+      { "role": "user", "content": "Hi there" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "thinking_off",
+    "messages": [{ "role": "user", "content": "Answer directly" }],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": false, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "effort_xhigh",
+    "messages": [{ "role": "user", "content": "Solve it" }],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "effort_medium",
+    "messages": [{ "role": "user", "content": "Solve it" }],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "medium", "preserve_thinking": true }
+  },
+  {
+    "name": "effort_low",
+    "messages": [{ "role": "user", "content": "Solve it" }],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "low", "preserve_thinking": true }
+  },
+  {
+    "name": "tools_nested_non_ascii",
+    "messages": [{ "role": "user", "content": "What is the weather in 東京?" }],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "查询天气 ☀️\nReturn the forecast",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string", "description": "城市名" },
+              "days": { "type": "integer", "minimum": 1 },
+              "unit": { "type": "string", "enum": ["c", "f"] },
+              "location": {
+                "type": "object",
+                "properties": {
+                  "lat": { "type": "number", "default": 0.5 },
+                  "lon": { "type": "number", "default": 1.0 }
+                },
+                "required": ["lat", "lon"]
+              }
+            },
+            "required": ["city"]
+          }
+        }
+      }
+    ],
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "tools_with_system",
+    "messages": [
+      { "role": "system", "content": "You may call tools." },
+      { "role": "user", "content": "Search for cats" }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search",
+          "description": "Search the web",
+          "parameters": { "type": "object", "properties": { "q": { "type": "string" } }, "required": ["q"] }
+        }
+      }
+    ],
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "medium", "preserve_thinking": true }
+  },
+  {
+    "name": "assistant_reasoning_preserve_true",
+    "messages": [
+      { "role": "user", "content": "What is 2+2?" },
+      { "role": "assistant", "content": "It is 4.", "reasoning_content": "  Let me add 2 and 2.  " },
+      { "role": "user", "content": "And 3+3?" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "assistant_reasoning_preserve_false",
+    "messages": [
+      { "role": "user", "content": "What is 2+2?" },
+      { "role": "assistant", "content": "It is 4.", "reasoning_content": "Some hidden thinking." },
+      { "role": "user", "content": "And 3+3?" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": false }
+  },
+  {
+    "name": "assistant_reasoning_preserve_false_after_query",
+    "messages": [
+      { "role": "user", "content": "First question" },
+      { "role": "assistant", "content": "First answer", "reasoning_content": "First thinking" },
+      { "role": "user", "content": "Second question" },
+      { "role": "assistant", "content": "Second answer", "reasoning_content": "Second thinking" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": false, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": false }
+  },
+  {
+    "name": "assistant_reasoning_null",
+    "messages": [
+      { "role": "user", "content": "Hi" },
+      { "role": "assistant", "content": "Hello", "reasoning_content": null }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "assistant_plain_content",
+    "messages": [
+      { "role": "user", "content": "Hi" },
+      { "role": "assistant", "content": "Plain answer without reasoning" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "content_list_text_parts",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "first part" },
+          { "type": "text", "text": " and second part" }
+        ]
+      }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "content_list_whitespace_trim",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "   leading and trailing   " }
+        ]
+      }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "content_string_whitespace_trim",
+    "messages": [{ "role": "user", "content": "\n\t  spaced out  \r\n" }],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "content_null",
+    "messages": [
+      { "role": "user", "content": "start" },
+      { "role": "assistant", "content": null },
+      { "role": "user", "content": "next" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "user_image_and_text",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } },
+          { "type": "text", "text": "describe this cat" }
+        ]
+      }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "user_video_and_text",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "type": "video", "video": "clip.mp4" },
+          { "type": "text", "text": "what happens?" }
+        ]
+      }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "tool_call_object_args",
+    "messages": [
+      { "role": "user", "content": "Book a flight" },
+      {
+        "role": "assistant",
+        "content": "I will look that up.",
+        "reasoning_content": "Need the flight tool.",
+        "tool_calls": [
+          {
+            "function": {
+              "name": "book_flight",
+              "arguments": {
+                "from": "PEK",
+                "to": "HND",
+                "passengers": 2,
+                "round_trip": true,
+                "options": { "class": "business", "meal": "veg" },
+                "dates": ["2026-01-01", "2026-01-08"]
+              }
+            }
+          }
+        ]
+      },
+      { "role": "tool", "content": "Booked, confirmation ABC123." }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "tool_call_string_args",
+    "messages": [
+      { "role": "user", "content": "Search for tea" },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_abc123",
+            "type": "function",
+            "function": {
+              "name": "search",
+              "arguments": "{\"query\": \"茶\", \"limit\": 5, \"fuzzy\": true, \"filters\": {\"lang\": \"zh\"}}"
+            }
+          }
+        ]
+      },
+      { "role": "tool", "content": "Found 5 results." }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search",
+          "description": "Search things",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": { "type": "string" },
+              "limit": { "type": "integer" },
+              "fuzzy": { "type": "boolean" },
+              "filters": { "type": "object" }
+            }
+          }
+        }
+      }
+    ],
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "tool_call_flat",
+    "messages": [
+      { "role": "user", "content": "Add numbers" },
+      {
+        "role": "assistant",
+        "content": "Working on it",
+        "tool_calls": [{ "name": "add", "arguments": { "a": 1, "b": 2 } }]
+      },
+      { "role": "tool", "content": "3" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "multiple_tool_calls",
+    "messages": [
+      { "role": "user", "content": "Do two things" },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          { "function": { "name": "first", "arguments": { "x": 1 } } },
+          { "function": { "name": "second", "arguments": { "y": "two" } } }
+        ]
+      },
+      { "role": "tool", "content": "first done" },
+      { "role": "tool", "content": "second done" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "single_tool_message",
+    "messages": [
+      { "role": "user", "content": "Compute" },
+      { "role": "assistant", "content": "", "tool_calls": [{ "function": { "name": "compute", "arguments": { "n": 7 } } }] },
+      { "role": "tool", "content": "42" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": false, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "tool_call_empty_arguments",
+    "messages": [
+      { "role": "user", "content": "Ping" },
+      { "role": "assistant", "content": "Pinging", "tool_calls": [{ "function": { "name": "ping", "arguments": "" } }] },
+      { "role": "tool", "content": "pong" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "tool_call_empty_object_arguments",
+    "messages": [
+      { "role": "user", "content": "Status?" },
+      { "role": "assistant", "content": "Checking", "tool_calls": [{ "function": { "name": "status", "arguments": {} } }] },
+      { "role": "tool", "content": "OK" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "assistant_empty_content_tool_call",
+    "messages": [
+      { "role": "user", "content": "Call it" },
+      { "role": "assistant", "content": "   ", "tool_calls": [{ "function": { "name": "f", "arguments": { "a": "b" } } }] },
+      { "role": "tool", "content": "done" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "floats",
+    "messages": [
+      { "role": "user", "content": "Compute" },
+      {
+        "role": "assistant",
+        "content": "Computing",
+        "tool_calls": [
+          {
+            "function": {
+              "name": "calc",
+              "arguments": { "ratio": 0.5, "scale": 1.0, "pi": 3.14, "tiny": 1e-05, "whole": 10 }
+            }
+          }
+        ]
+      },
+      { "role": "tool", "content": "done" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "unicode_cjk_emoji",
+    "messages": [
+      { "role": "system", "content": "你是一个有用的助手 🤖" },
+      { "role": "user", "content": "请解释量子纠缠 😀 — with mixed English and 中文" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "tools_empty_array",
+    "messages": [{ "role": "user", "content": "No tools here" }],
+    "tools": [],
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "system_empty_content",
+    "messages": [
+      { "role": "system", "content": "" },
+      { "role": "user", "content": "Hi" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "low", "preserve_thinking": true }
+  },
+  {
+    "name": "user_content_list_system",
+    "messages": [
+      { "role": "system", "content": [{ "type": "text", "text": "System as a list." }] },
+      { "role": "user", "content": "Go" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "tool_response_user_message",
+    "messages": [
+      { "role": "user", "content": "Start" },
+      { "role": "assistant", "content": "", "tool_calls": [{ "function": { "name": "f", "arguments": { "x": 1 } } }] },
+      { "role": "user", "content": "<tool_response>\nalready wrapped\n</tool_response>" },
+      { "role": "assistant", "content": "Done." }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true }
+  },
+  {
+    "name": "multi_step_second_turn",
+    "messages": [
+      { "role": "system", "content": "Sys" },
+      { "role": "user", "content": "q1" },
+      { "role": "assistant", "content": "a1", "tool_calls": [{ "function": { "name": "f", "arguments": { "x": 1 } } }] },
+      { "role": "tool", "content": "r1" },
+      { "role": "assistant", "content": "a2", "tool_calls": [{ "function": { "name": "f", "arguments": { "x": 2 } } }] },
+      { "role": "tool", "content": "r2" }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "f",
+          "description": "A function",
+          "parameters": {
+            "type": "object",
+            "properties": { "x": { "type": "integer" }, "when": { "type": "string" } },
+            "required": ["x"]
+          }
+        }
+      }
+    ],
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": false }
+  },
+  {
+    "name": "error_no_user",
+    "messages": [
+      { "role": "system", "content": "Only a system message." },
+      { "role": "assistant", "content": "and an assistant message" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true },
+    "expect_error": true
+  },
+  {
+    "name": "error_bad_effort",
+    "messages": [{ "role": "user", "content": "Hi" }],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "high", "preserve_thinking": true },
+    "expect_error": true
+  },
+  {
+    "name": "error_system_not_first",
+    "messages": [
+      { "role": "user", "content": "Hi" },
+      { "role": "system", "content": "Too late." }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true },
+    "expect_error": true
+  },
+  {
+    "name": "error_no_messages",
+    "messages": [],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true },
+    "expect_error": true
+  },
+  {
+    "name": "error_system_image",
+    "messages": [
+      { "role": "system", "content": [{ "type": "image", "image_url": { "url": "x" } }] },
+      { "role": "user", "content": "Hi" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true },
+    "expect_error": true
+  },
+  {
+    "name": "error_system_video",
+    "messages": [
+      { "role": "system", "content": [{ "type": "video", "video": "x" }] },
+      { "role": "user", "content": "Hi" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true },
+    "expect_error": true
+  },
+  {
+    "name": "error_unknown_role",
+    "messages": [
+      { "role": "user", "content": "Hi" },
+      { "role": "developer", "content": "nope" }
+    ],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true },
+    "expect_error": true
+  },
+  {
+    "name": "error_unexpected_content_type",
+    "messages": [{ "role": "user", "content": { "unexpected": "object" } }],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true },
+    "expect_error": true
+  },
+  {
+    "name": "error_unexpected_item_type",
+    "messages": [{ "role": "user", "content": [{ "unknown": "item" }] }],
+    "tools": null,
+    "options": { "add_generation_prompt": true, "enable_thinking": true, "reasoning_effort": "xhigh", "preserve_thinking": true },
+    "expect_error": true
+  }
+]

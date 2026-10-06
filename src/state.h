@@ -1,0 +1,72 @@
+// klein - Qwen3.8 inference engine
+// Copyright (C) 2026 klein contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include <vector>
+
+#include "ggml-backend.h"
+#include "ggml.h"
+#include "model.h"
+
+namespace klein {
+
+struct StateConfig {
+    int n_ctx = 0;
+    ggml_type type_k = GGML_TYPE_Q8_0;
+    ggml_type type_v = GGML_TYPE_Q8_0;
+    Place kv_place = Place::Gpu;
+    int n_snapshots = 1;      // recurrent state slots: 1 + max draft tokens (for rollback after rejected drafts)
+    int max_batch = 512;      // largest batch a forward pass takes (bounds the hidden-state buffer)
+};
+
+// The memory of one sequence: the KV cache of the full-attention layers (and of the MTP layer), the Gated
+// DeltaNet recurrent states with rollback snapshots, and the last hidden states (input of the MTP head).
+class State {
+public:
+    State(const Model& model, const StateConfig& cfg, ggml_backend_buffer_type_t gpu_buft, ggml_backend_buffer_type_t host_buft);
+    ~State();
+    State(const State&) = delete;
+    State& operator=(const State&) = delete;
+
+    const StateConfig& cfg() const { return cfg_; }
+
+    // KV cache per full-attention layer, indexed by decoder layer id (nullptr for recurrent layers);
+    // the MTP layer's cache is at index n_layer. Shape [n_head_kv * head_dim, n_ctx].
+    ggml_tensor* k(int il) const { return k_[il]; }
+    ggml_tensor* v(int il) const { return v_[il]; }
+    // Recurrent state per DeltaNet layer: [row, n_snapshots], slot 0 = current, slot s = s tokens back.
+    ggml_tensor* conv(int il) const { return conv_[il]; }
+    ggml_tensor* ssm(int il) const { return ssm_[il]; }
+    // Final-norm hidden states of the last main forward pass: [n_embd, max_batch].
+    ggml_tensor* hidden() const { return hidden_; }
+    // Final-norm hidden states written by MTP passes (input of the next chained draft): [n_embd, max_batch].
+    ggml_tensor* mtp_hidden() const { return mtp_hidden_; }
+
+    size_t kv_bytes() const { return kv_bytes_; }
+    size_t recurrent_bytes() const { return rec_bytes_; }
+
+    int n_past = 0;      // tokens in the main model's cache
+    int n_past_mtp = 0;  // positions whose MTP-layer KV was computed from the main model's true hidden states
+
+    void clear(ggml_backend_t gpu);
+
+    // Make slot `s` the current recurrent state (after `s` trailing tokens of the last batch were rejected).
+    void rollback_recurrent(ggml_backend_t gpu, int s);
+
+private:
+    const Model& model_;
+    StateConfig cfg_;
+    ggml_context* ctx_ = nullptr;
+    std::vector<ggml_backend_buffer_t> buffers_;
+    std::vector<ggml_tensor*> k_, v_, conv_, ssm_;
+    ggml_tensor* hidden_ = nullptr;
+    ggml_tensor* mtp_hidden_ = nullptr;
+    size_t kv_bytes_ = 0, rec_bytes_ = 0;
+};
+
+// Bytes the state needs, for planning before anything is allocated.
+size_t state_kv_bytes(const HParams& hp, const StateConfig& cfg, bool with_mtp);
+size_t state_recurrent_bytes(const HParams& hp, const StateConfig& cfg);
+
+}  // namespace klein
