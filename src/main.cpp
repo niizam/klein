@@ -15,6 +15,7 @@
 
 #include "common.h"
 #include "engine.h"
+#include "server.h"
 
 using namespace klein;
 
@@ -30,6 +31,7 @@ struct Args {
     int ppl_chunks = 0;
     int ppl_batch = 64;
     std::string kld_base;
+    ServerOptions so;
     bool raw = false;
     bool think = false;
     SamplerParams sp;
@@ -37,7 +39,8 @@ struct Args {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: klein <run|bench|ppl> -m MODEL.gguf [options]\n"
+                 "usage: klein <run|bench|ppl|serve> -m MODEL.gguf [options]\n"
+                 "  serve: --host H (127.0.0.1), --port N (8080), --api-key KEY, --alias NAME\n"
                  "  --mtp FILE          separate MTP GGUF (smaller draft block)\n"
                  "  -c, --ctx N         context length (default 262144)\n"
                  "  --kv TYPE           KV cache type: auto|f16|q8_0|q4_0\n"
@@ -75,6 +78,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--vram-margin") a.ec.vram_margin_mb = std::stoul(next());
         else if (s == "--compute-reserve") a.ec.compute_reserve_mb = std::stoul(next());
         else if (s == "--no-repack") a.ec.cpu_repack = false;
+        else if (s == "--kv-cpu-attn") a.ec.kv_zero_copy = false;
         else if (s == "-p") a.prompt = next();
         else if (s == "-f") a.file = next();
         else if (s == "-n") a.n_predict = std::stoi(next());
@@ -83,6 +87,10 @@ Args parse(int argc, char** argv) {
         else if (s == "--chunks") a.ppl_chunks = std::stoi(next());
         else if (s == "--ppl-batch") a.ppl_batch = std::stoi(next());
         else if (s == "--kld-base") a.kld_base = next();
+        else if (s == "--host") a.so.host = next();
+        else if (s == "--port") a.so.port = std::stoi(next());
+        else if (s == "--api-key") a.so.api_key = next();
+        else if (s == "--alias") a.so.model_name = next();
         else if (s == "--raw") a.raw = true;
         else if (s == "--think") a.think = true;
         else if (s == "--temp") a.sp.temperature = std::stof(next());
@@ -270,5 +278,9 @@ int main(int argc, char** argv) {
     if (a.cmd == "run") return cmd_run(a);
     if (a.cmd == "bench") return cmd_bench(a);
     if (a.cmd == "ppl") return cmd_ppl(a);
+    if (a.cmd == "serve") {
+        Engine eng(a.ec);
+        return run_server(eng, a.so);
+    }
     usage();
 }

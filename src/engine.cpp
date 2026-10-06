@@ -68,7 +68,12 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_);
     ggml_backend_buffer_type_t host_buft = ggml_backend_cuda_host_buffer_type();  // pinned: fast streaming to the GPU
     model_->load(gpu_buft, host_buft);
-    state_ = std::make_unique<State>(*model_, plan_.state, gpu_buft, host_buft);
+    // A KV cache in RAM is mapped into the GPU's address space: attention runs on the GPU and reads the cells it
+    // needs over PCIe, instead of round-tripping every attention layer through the CPU.
+    ggml_backend_buffer_type_t kv_host_buft = cfg.kv_zero_copy ? ggml_backend_cuda_mapped_host_buffer_type(0) : nullptr;
+    kv_mapped_ = kv_host_buft != nullptr;
+    if (!kv_host_buft) kv_host_buft = host_buft;
+    state_ = std::make_unique<State>(*model_, plan_.state, gpu_buft, kv_host_buft);
 
     // --- scheduler ---
     ggml_backend_t backends[2] = {gpu_, cpu_};
@@ -107,7 +112,7 @@ void Engine::run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_
 
     ggml_backend_sched_reset(sched_);
     // With the KV cache in RAM, small batches attend on the CPU (copying the cache to the GPU would cost more).
-    if (state_->cfg().kv_place == Place::Host && a.n < 32) {
+    if (state_->cfg().kv_place == Place::Host && !kv_mapped_ && a.n < 32) {
         for (ggml_tensor* t : g.attn_nodes) ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
     }
     if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) fatal("failed to allocate the compute graph");

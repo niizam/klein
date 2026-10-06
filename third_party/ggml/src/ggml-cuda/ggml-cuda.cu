@@ -722,14 +722,19 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    bool host_mapped = false; // [klein] pinned host memory used through unified addressing (zero-copy)
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool host_mapped = false) :
         device(device), dev_ptr(dev_ptr),
-        name(GGML_CUDA_NAME + std::to_string(device)) {
+        name(GGML_CUDA_NAME + std::to_string(device)), host_mapped(host_mapped) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (host_mapped) {
+            CUDA_CHECK(cudaFreeHost(dev_ptr));
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -761,8 +766,12 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
 
         if (padded_size > original_size) {
-            ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            if (ctx->host_mapped) {
+                memset((char *)tensor->data + original_size, 0, padded_size - original_size);
+            } else {
+                ggml_cuda_set_device(ctx->device);
+                CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            }
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -772,6 +781,11 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ctx->host_mapped) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        memset((char *) tensor->data + offset, value, size);
+        return;
+    }
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -780,7 +794,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, ctx->host_mapped ? cudaMemcpyDefault : cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -788,7 +802,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, ctx->host_mapped ? cudaMemcpyDefault : cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -821,7 +835,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
         if (src_physical == dst_physical) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDefault, cudaStreamPerThread));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
@@ -841,6 +855,11 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ctx->host_mapped) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        memset(ctx->dev_ptr, value, buffer->size);
+        return;
+    }
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -929,6 +948,49 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .get_alloc_size_n    = */ NULL,
     /* .is_host             = */ NULL,
 };
+
+// [klein] Mapped host buffer type: pinned host memory (cudaMallocHost) handed to the CUDA backend as if it were device
+// memory. With unified virtual addressing the host pointer is valid in kernels, which then read/write it over PCIe.
+// The scheduler treats tensors in it as GPU tensors, so ops run on the GPU without copying the whole tensor first.
+static ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+    ggml_cuda_set_device(buft_ctx->device);
+    void * ptr = nullptr;
+    cudaError_t err = cudaMallocHost(&ptr, size);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_ERROR("%s: allocating %.2f MiB of pinned host memory failed: %s\n", __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, ptr, /*host_mapped=*/ true);
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_mapped_host_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+    int uva = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device));
+    if (!uva) {
+        return nullptr;
+    }
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
+    if (!initialized[device]) {
+        ggml_backend_buffer_type_i iface = ggml_backend_cuda_buffer_type_interface;
+        iface.alloc_buffer = ggml_backend_cuda_mapped_buffer_type_alloc_buffer;
+        types[device] = {
+            /* .iface    = */ iface,
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+            /* .context  = */ new ggml_backend_cuda_buffer_type_context{device, GGML_CUDA_NAME + std::to_string(device) + "_Mapped"},
+        };
+        initialized[device] = true;
+    }
+    return &types[device];
+}
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;

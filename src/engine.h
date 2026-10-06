@@ -29,6 +29,7 @@ struct EngineConfig {
     size_t vram_margin_mb = 384;
     size_t compute_reserve_mb = 0; // 0 = estimate
     bool cpu_repack = true;        // repacked CPU copies of spilled weights (faster small-batch decode, more RAM)
+    bool kv_zero_copy = true;      // host KV cache read by the GPU over PCIe (else: attention on the CPU)
 };
 
 struct GenStats {
@@ -86,6 +87,7 @@ private:
     Plan plan_;
     std::vector<uint8_t> meta_buf_;
     bool mtp_ready_ = false;            // MTP logits for the next draft are in mtp_logits_
+    bool kv_mapped_ = false;            // host KV cache is mapped into the GPU address space (zero-copy)
     std::vector<float> mtp_logits_;
     std::vector<int32_t> cache_;        // tokens at positions 0 .. n_past-1 (for prompt-prefix reuse)
     int mtp_h_row_ = 0;                 // row of State::mtp_hidden holding the last MTP hidden state

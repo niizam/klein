@@ -38,8 +38,13 @@ add_library(klein_core STATIC
     src/sampler.cpp
     src/engine.cpp
     src/transcode.cpp
-    src/chat.cpp)
-target_include_directories(klein_core PUBLIC src third_party/json)
+    src/chat.cpp
+    src/server.cpp)
+target_include_directories(klein_core PUBLIC src third_party/json third_party/httplib)
+if (WIN32)
+    target_link_libraries(klein_core PUBLIC ws2_32)
+    target_compile_definitions(klein_core PUBLIC _WIN32_WINNT=0x0A00)
+endif()
 target_link_libraries(klein_core PUBLIC ggml ggml-base ggml-cpu ggml-cuda klein_unicode)
 if (MSVC)
     target_compile_options(klein_core PRIVATE /W3 /utf-8)
