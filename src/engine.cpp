@@ -14,6 +14,9 @@
 
 namespace klein {
 
+// VRAM kept for decode-time compute buffers (verify batches of a few tokens, MTP passes, logits).
+static constexpr size_t kDecodeReserve = 192ull << 20;
+
 static ggml_type parse_kv_type(const std::string& s) {
     if (s == "f16") return GGML_TYPE_F16;
     if (s == "q8_0") return GGML_TYPE_Q8_0;
@@ -54,13 +57,14 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     // VRAM is planned for prompts up to `base_kv` positions; longer prompts make room by demoting FFN blocks
     // (context-elastic placement, see ensure_prefill_vram()).
     n_ctx_cfg_ = pin.state.n_ctx;
-    const int base_kv = std::min(pin.state.n_ctx, cfg.base_ctx);
-    pin.compute_reserve = cfg.compute_reserve_mb > 0 ? (cfg.compute_reserve_mb << 20) : compute_need(base_kv);
+    // Planned for decoding; every prefill makes room for its own scratch by demoting FFN blocks, then promotes them.
+    pin.compute_reserve = cfg.compute_reserve_mb > 0 ? (cfg.compute_reserve_mb << 20) : kDecodeReserve;
     plan_ = plan_placement(*model_, pin);
     // enough demotable blocks (RAM copies prepared at load) to fit the prefill scratch of a full-context prompt
     int n_elastic = 0;
     {
-        const size_t extra = compute_need(pin.state.n_ctx) > pin.compute_reserve ? compute_need(pin.state.n_ctx) - pin.compute_reserve : 0;
+        const size_t worst = compute_need(pin.state.n_ctx, cfg.n_ubatch);
+        const size_t extra = worst > pin.compute_reserve ? worst - pin.compute_reserve : 0;
         size_t got = 0;
         for (size_t i = plan_.n_spilled_blocks; i < plan_.block_order.size() && got < extra; ++i, ++n_elastic) {
             for (auto& w : model_->weights) {
@@ -91,9 +95,8 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     meta_buf_.resize(ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false));
     mtp_logits_.resize(hp.n_vocab);
 
-    size_t f2 = 0, t2 = 0;
-    ggml_backend_dev_memory(ggml_backend_get_device(gpu_), &f2, &t2);
-    KLOG_INFO("ready: %.2f GiB VRAM still free", f2 / GiB);
+    warmup();
+    KLOG_INFO("ready: %.2f GiB VRAM still free", this->vram_free() / GiB);
 }
 
 Engine::~Engine() {
@@ -104,18 +107,18 @@ Engine::~Engine() {
     if (gpu_) ggml_backend_free(gpu_);
 }
 
-size_t Engine::compute_need(int n_kv) const {
+size_t Engine::compute_need(int n_kv, int n_tokens) const {
     // Prefill compute buffer: activations of one chunk, streamed copies of spilled weights, and the f16 K/V copy that
     // flash attention makes of a quantized cache (the dominant term for long prompts).
     const HParams& hp = model_->hp;
-    const size_t act = (size_t) 4 * cfg_.n_ubatch * hp.n_ff * sizeof(float);
+    const size_t act = (size_t) 4 * std::min(n_tokens, cfg_.n_ubatch) * hp.n_ff * sizeof(float);
     const size_t streamed = 160ull << 20;
     const size_t fa_conv = (size_t) n_kv * hp.kv_row() * 2 * sizeof(uint16_t);
     return act + streamed + fa_conv;
 }
 
-void Engine::ensure_prefill_vram(int n_kv_end) {
-    const size_t need = compute_need(padded_n_kv(n_kv_end, n_ctx_cfg_));
+void Engine::ensure_prefill_vram(int n_kv_end, int n_tokens) {
+    const size_t need = compute_need(padded_n_kv(n_kv_end, n_ctx_cfg_), n_tokens);
     const size_t have_sched = ggml_backend_sched_get_buffer_size(sched_, gpu_);
     int n = 0;
     while (vram_free() + have_sched < need + margin_ && model_->next_demote_bytes() > 0 && model_->demote()) ++n;
@@ -127,7 +130,7 @@ void Engine::relax_after_prefill() {
     // Drop the prefill-sized compute buffers, then bring FFN blocks back to VRAM while it has room. Decode needs
     // little scratch, and every block in VRAM saves CPU time on every token.
     if (model_->n_host_blocks() == 0) return;
-    const size_t decode_need = 320ull << 20;
+    const size_t decode_need = kDecodeReserve;
     const size_t sched_buf = ggml_backend_sched_get_buffer_size(sched_, gpu_);
     if (sched_buf <= decode_need && vram_free() < margin_ + decode_need + model_->next_promote_bytes()) return;
     ggml_backend_sched_free(sched_);
@@ -138,6 +141,18 @@ void Engine::relax_after_prefill() {
            model_->n_host_blocks() > plan_.n_spilled_blocks && model_->promote())
         ++n;
     if (n > 0) KLOG_DEBUG("moved %d FFN blocks back to VRAM for decoding (%d in RAM)", n, model_->n_host_blocks());
+}
+
+void Engine::warmup() {
+    // CUDA loads kernel modules lazily on first use; run every graph shape once so the first request does not pay
+    // for it (and the CUDA memory pool reaches its working size).
+    const double t0 = now_ms();
+    std::vector<int32_t> toks(64, tok_.n_vocab() > 1000 ? 1000 : 0);
+    std::vector<float> logits;
+    Sampler smp(SamplerParams{});
+    generate(toks, 3, smp, [](int32_t) { return true; });
+    reset();
+    KLOG_DEBUG("warm-up %.0f ms", now_ms() - t0);
 }
 
 void Engine::reset() {
@@ -248,7 +263,7 @@ void Engine::prefill(const std::vector<int32_t>& tokens, std::vector<float>& las
     const double t0 = now_ms();
     const bool use_mtp = model_->has_mtp() && cfg_.n_draft > 0;
     const int n = (int) tokens.size();
-    if (n > cfg_.n_draft + 1) ensure_prefill_vram(state_->n_past + n);
+    if (n > cfg_.n_draft + 1) ensure_prefill_vram(state_->n_past + n, n);
     for (int i = 0; i < n; i += cfg_.n_ubatch) {
         const int nb = std::min(cfg_.n_ubatch, n - i);
         const bool last = i + nb >= n;
@@ -354,6 +369,9 @@ GenStats Engine::generate(const std::vector<int32_t>& prompt, int n_predict, Sam
         st.t_mtp_ms += now_ms() - tp;
     }
     st.t_gen_ms = now_ms() - t0;
+    KLOG_DEBUG("compute buffers after decode: GPU %.0f MiB, CPU %.0f MiB; VRAM free %.0f MiB; %d FFN blocks in RAM",
+               ggml_backend_sched_get_buffer_size(sched_, gpu_) / MiB, ggml_backend_sched_get_buffer_size(sched_, cpu_) / MiB,
+               vram_free() / MiB, model_->n_host_blocks());
     return st;
 }
 

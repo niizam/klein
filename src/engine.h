@@ -24,14 +24,13 @@ struct EngineConfig {
     std::string kv_type = "auto";  // auto | f16 | q8_0 | q4_0
     std::string kv_place = "auto"; // auto | gpu | host
     int n_threads = 8;
-    int n_ubatch = 512;            // prefill chunk
+    int n_ubatch = 2048;           // prefill chunk
     int n_draft = 3;               // MTP draft tokens per step (0 = no speculation)
-    size_t vram_margin_mb = 384;
+    size_t vram_margin_mb = 256;
     size_t compute_reserve_mb = 0; // 0 = estimate
     bool cpu_repack = true;        // repacked CPU copies of spilled weights (faster small-batch decode, more RAM)
     bool kv_zero_copy = true;      // host KV cache read by the GPU over PCIe (else: attention on the CPU)
     int mtp_window = 16384;        // MTP head attention window (positions)
-    int base_ctx = 8192;           // VRAM is planned for prompts up to this many positions; longer ones demote FFN blocks
 };
 
 struct GenStats {
@@ -103,9 +102,10 @@ private:
         std::vector<float>* logits;
     };
     void run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_dst);
-    size_t compute_need(int n_kv) const;
-    void ensure_prefill_vram(int n_kv_end);
+    size_t compute_need(int n_kv, int n_tokens) const;
+    void ensure_prefill_vram(int n_kv_end, int n_tokens);
     void relax_after_prefill();
+    void warmup();
     int n_ctx_cfg_ = 0;
     size_t margin_ = 0;
     // MTP pass over tokens at positions pos0.., reading main hidden rows [h_row0, h_row0 + n).
