@@ -9,10 +9,12 @@ license file.
 | `third_party/llama-unicode` | `src/unicode*.{cpp,h}` from llama.cpp b11435 | MIT | Unicode categories and the pre-tokenizer regex split |
 | `third_party/httplib` | [cpp-httplib](https://github.com/yhirose/cpp-httplib) 0.59.0 | MIT | HTTP server |
 | `third_party/json` | [nlohmann/json](https://github.com/nlohmann/json) 3.12.0 | MIT | JSON |
+| `third_party/stb` | [stb_image](https://github.com/nothings/stb) 2.30 | public domain / MIT | image decoding |
 
 The qwen35 graph (`src/graph.cpp`) and the BPE tokenizer (`src/tokenizer.cpp`) follow llama.cpp's
 implementations (`src/models/qwen35.cpp`, `delta-net-base.cpp`, `llama-vocab.cpp`, MIT), which klein uses as the
-reference for numerical and token-level correctness.
+reference for numerical and token-level correctness. The vision encoder (`src/vision.cpp`) and image preprocessing
+(`src/image.cpp`) follow llama.cpp's `tools/mtmd` (`models/qwen3vl.cpp`, `clip.cpp`, `mtmd-image.cpp`, MIT).
 
 ## Changes to the vendored ggml
 

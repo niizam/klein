@@ -110,6 +110,7 @@ main { overflow-y: auto; padding: 2rem 1.25rem 1rem; }
 .msg.bot table { border-collapse: collapse; font-size: 0.9375rem; min-width: 60%; }
 .msg.bot th, .msg.bot td { border-bottom: 1px solid var(--line); padding: 0.4rem 0.9rem 0.4rem 0; text-align: left; vertical-align: top; }
 .msg.bot th { font-weight: 600; border-bottom-color: var(--muted); }
+.msg.bot blockquote { margin: 0 0 0.9rem; padding: 0.1rem 0 0.1rem 0.9rem; border-left: 3px solid var(--line); color: var(--muted); }
 .msg.bot hr { border: 0; border-top: 1px solid var(--line); margin: 1.4rem 0; }
 .msg.bot code { font: 0.875em var(--mono); background: var(--code-bg); border: 1px solid var(--line); border-radius: 4px; padding: 0.05em 0.3em; }
 .code { position: relative; margin: 0 0 1rem; }
@@ -149,8 +150,27 @@ footer { padding: 0 1.25rem 1.1rem; }
   box-shadow: 0 1px 0 var(--line), 0 8px 24px -16px rgba(27, 37, 64, .35);
 }
 .composer:focus-within { border-color: var(--accent); }
+.composer.drop { border-style: dashed; border-color: var(--accent); }
+.field { flex: 1; display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; }
+.thumbs { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.thumbs:empty { display: none; }
+.thumb { position: relative; width: 4rem; height: 4rem; border-radius: 0.6rem; overflow: hidden; border: 1px solid var(--line); }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb button {
+  position: absolute; top: 0.2rem; right: 0.2rem; width: 1.3rem; height: 1.3rem; border-radius: 50%; border: 0;
+  background: rgba(27, 37, 64, .75); color: #fff; font-size: 0.8rem; line-height: 1; cursor: pointer; padding: 0;
+}
+.attach {
+  border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0.35rem; border-radius: 0.6rem;
+  align-self: flex-end; display: inline-flex;
+}
+.attach:hover { color: var(--accent); }
+.attach svg { width: 1.3rem; height: 1.3rem; }
+.msg.user .imgs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.4rem; justify-content: flex-end; }
+.msg.user .imgs img { max-height: 12rem; max-width: 100%; border-radius: 0.6rem; display: block; }
+.msg.user .imgs .gone { font-size: 0.8125rem; color: var(--muted); font-style: italic; }
 .composer textarea {
-  flex: 1; border: 0; outline: 0; background: none; resize: none; max-height: 14rem; min-height: 1.6rem;
+  width: 100%; border: 0; outline: 0; background: none; resize: none; max-height: 14rem; min-height: 1.6rem;
   padding: 0.3rem 0; line-height: 1.5;
 }
 .send {
@@ -200,7 +220,16 @@ footer { padding: 0 1.25rem 1.1rem; }
 
 <footer>
   <form class="composer" id="form">
-    <textarea id="input" rows="1" placeholder="Message klein" aria-label="Message"></textarea>
+    <button class="attach" id="attach" type="button" hidden aria-label="Attach an image" title="Attach an image">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.8"/><path d="M21 16l-5-5-8 8"/>
+      </svg>
+    </button>
+    <input type="file" id="file" accept="image/*" multiple hidden>
+    <div class="field">
+      <div class="thumbs" id="thumbs"></div>
+      <textarea id="input" rows="1" placeholder="Message klein" aria-label="Message"></textarea>
+    </div>
     <button class="send" id="send" type="submit" disabled>Send</button>
   </form>
   <div class="below"><span id="status">&nbsp;</span><span class="hint">Enter to send, Shift+Enter for a new line</span></div>
@@ -223,6 +252,8 @@ const apiKey = store.get("key", "");
 const authHeaders = apiKey ? { Authorization: "Bearer " + apiKey } : {};
 
 let messages = store.get("messages", []);
+let vision = false;
+let attached = []; // data URLs of images attached to the next message
 let effort = store.get("effort", "none");
 let busy = null; // AbortController while generating
 
@@ -235,6 +266,8 @@ async function ping() {
     const m = j.data && j.data[0];
     const ctx = m && m.context_length ? `, ${Math.round(m.context_length / 1024)}K context` : "";
     $("model").textContent = (m ? m.id : "model") + ctx;
+    vision = !!(m && m.modalities && m.modalities.includes("image"));
+    $("attach").hidden = !vision;
     $("dot").className = "dot on";
   } catch (e) {
     $("model").textContent = e.message === "key" ? "This server needs an API key: open /?key=YOUR_KEY"
@@ -253,8 +286,11 @@ function inline(s) {
 }
 // Line-based block parser for the non-code parts: headings, lists, rules, paragraphs.
 function blocks(text, out) {
-  let para = [], list = null, table = [];
+  let para = [], list = null, table = [], quote = [];
   const flushPara = () => { if (para.length) { out.push("<p>" + para.map(inline).join("<br>") + "</p>"); para = []; } };
+  const flushQuote = () => {
+    if (quote.length) { out.push("<blockquote>" + quote.map(inline).join("<br>") + "</blockquote>"); quote = []; }
+  };
   const flushTable = () => {
     if (!table.length) return;
     const cells = (row) => row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => inline(c.trim()));
@@ -269,6 +305,8 @@ function blocks(text, out) {
     let m;
     if (/^\s*\|.*\|\s*$/.test(line)) { flushPara(); flushList(); table.push(line); continue; }
     flushTable();
+    if ((m = line.match(/^\s*&gt;\s?(.*)$/))) { flushPara(); flushList(); quote.push(m[1]); continue; }
+    flushQuote();
     if (/^\s*$/.test(line)) { flushPara(); flushList(); continue; }
     if ((m = line.match(/^(#{1,4})\s+(.*)$/))) {
       flushPara(); flushList();
@@ -289,7 +327,7 @@ function blocks(text, out) {
     flushList();
     para.push(line);
   }
-  flushPara(); flushList(); flushTable();
+  flushPara(); flushList(); flushTable(); flushQuote();
 }
 
 function markdown(src) {
@@ -311,10 +349,28 @@ function markdown(src) {
 function atBottom() { return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80; }
 function toBottom() { scroller.scrollTop = scroller.scrollHeight; }
 
-function renderUser(text) {
+function renderUser(text, images) {
   const el = document.createElement("div");
   el.className = "msg user";
-  el.textContent = text;
+  if (images && images.length) {
+    const box = document.createElement("div");
+    box.className = "imgs";
+    for (const src of images) {
+      if (src) {
+        const img = document.createElement("img");
+        img.src = src;
+        img.alt = "Attached image";
+        box.appendChild(img);
+      } else {
+        const s = document.createElement("span");
+        s.className = "gone";
+        s.textContent = "Image not kept in this browser";
+        box.appendChild(s);
+      }
+    }
+    el.appendChild(box);
+  }
+  if (text) el.appendChild(document.createTextNode(text));
   thread.appendChild(el);
 }
 
@@ -349,7 +405,7 @@ function renderAll() {
   thread.innerHTML = "";
   $("empty").hidden = messages.length > 0;
   for (const m of messages) {
-    if (m.role === "user") renderUser(m.content);
+    if (m.role === "user") renderUser(m.content, m.images);
     else {
       const v = botView();
       v.setReasoning(m.reasoning_content || "", m.thoughtLabel || "Thought");
@@ -362,10 +418,12 @@ function renderAll() {
 
 /* ---------- chat ---------- */
 async function send(text) {
-  if (busy || !text.trim()) return;
+  if (busy || (!text.trim() && !attached.length)) return;
   $("empty").hidden = true;
-  messages.push({ role: "user", content: text });
-  renderUser(text);
+  const images = attached;
+  attached = []; paintThumbs();
+  messages.push(images.length ? { role: "user", content: text, images } : { role: "user", content: text });
+  renderUser(text, images);
   input.value = ""; autosize();
   const view = botView();
   view.setContent("", true);
@@ -394,8 +452,13 @@ async function send(text) {
       headers: { "Content-Type": "application/json", ...authHeaders },
       signal: busy.signal,
       body: JSON.stringify({
-        messages: messages.map(({ role, content, reasoning_content }) =>
-          role === "assistant" ? { role, content, reasoning_content } : { role, content }),
+        messages: messages.map(({ role, content, reasoning_content, images }) => {
+          if (role === "assistant") return { role, content, reasoning_content };
+          if (!images || !images.length) return { role, content };
+          const parts = images.filter(Boolean).map((url) => ({ type: "image_url", image_url: { url } }));
+          if (content) parts.push({ type: "text", text: content });
+          return { role, content: parts };
+        }),
         stream: true,
         stream_options: { include_usage: true },
         reasoning_effort: effort,
@@ -465,17 +528,75 @@ async function send(text) {
   reply.stats = errorText ? "" : stats;
   if (reply.content || reply.reasoning_content) messages.push(reply);
   else if (errorText) messages.pop();
-  store.set("messages", messages);
+  saveMessages();
   statusEl.textContent = stats || " ";
   busy = null;
   setBusy(false);
 }
 
+// Browsers keep a few MB per site: if the conversation with its images does not fit, keep it without them.
+function saveMessages() {
+  try { localStorage.setItem("klein.messages", JSON.stringify(messages)); return; } catch {}
+  const slim = messages.map((m) => (m.images ? { ...m, images: m.images.map(() => null) } : m));
+  try { localStorage.setItem("klein.messages", JSON.stringify(slim)); } catch {}
+}
+
+/* ---------- images ---------- */
+// Downscale in the browser (long side <= 1536 px, JPEG) so requests stay small; klein resizes further itself.
+function readImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, 1536 / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * scale);
+      c.height = Math.round(img.height * scale);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL("image/jpeg", 0.92));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("not an image")); };
+    img.src = url;
+  });
+}
+async function addFiles(files) {
+  if (!vision) return;
+  for (const f of files) {
+    if (!f.type.startsWith("image/")) continue;
+    try { attached.push(await readImage(f)); } catch { statusEl.textContent = `Couldn't read ${f.name} as an image.`; }
+  }
+  paintThumbs();
+}
+function paintThumbs() {
+  const box = $("thumbs");
+  box.innerHTML = "";
+  attached.forEach((src, i) => {
+    const t = document.createElement("div");
+    t.className = "thumb";
+    t.innerHTML = '<img alt="Attached image"><button type="button" aria-label="Remove image">\u00d7</button>';
+    t.querySelector("img").src = src;
+    t.querySelector("button").addEventListener("click", () => { attached.splice(i, 1); paintThumbs(); });
+    box.appendChild(t);
+  });
+  if (!busy) sendBtn.disabled = !input.value.trim() && !attached.length;
+}
+$("attach").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", (e) => { addFiles([...e.target.files]); e.target.value = ""; });
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData ? e.clipboardData.files : [])].filter((f) => f.type.startsWith("image/"));
+  if (files.length && vision) { e.preventDefault(); addFiles(files); }
+});
+const form = $("form");
+form.addEventListener("dragover", (e) => { if (vision) { e.preventDefault(); form.classList.add("drop"); } });
+form.addEventListener("dragleave", () => form.classList.remove("drop"));
+form.addEventListener("drop", (e) => { e.preventDefault(); form.classList.remove("drop"); addFiles([...e.dataTransfer.files]); });
+
 function setBusy(on) {
   sendBtn.textContent = on ? "Stop" : "Send";
   sendBtn.classList.toggle("stop", on);
   sendBtn.type = on ? "button" : "submit";
-  sendBtn.disabled = !on && !input.value.trim();
+  sendBtn.disabled = !on && !input.value.trim() && !attached.length;
   if (on) statusEl.textContent = "Writing…";
 }
 
@@ -483,7 +604,7 @@ function setBusy(on) {
 function autosize() {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 224) + "px";
-  if (!busy) sendBtn.disabled = !input.value.trim();
+  if (!busy) sendBtn.disabled = !input.value.trim() && !attached.length;
 }
 input.addEventListener("input", autosize);
 input.addEventListener("keydown", (e) => {
@@ -504,7 +625,8 @@ $("effort").addEventListener("click", (e) => {
 
 $("new").addEventListener("click", () => {
   if (busy) busy.abort();
-  messages = []; store.set("messages", messages);
+  messages = []; saveMessages();
+  attached = []; paintThumbs();
   statusEl.textContent = " ";
   renderAll(); input.focus();
 });

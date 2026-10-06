@@ -217,3 +217,28 @@ one to run is the user's call (`-m`).
 | f16 (default) | 1 | 0.0096 |
 
 f16 and bf16 take the same VRAM; f16 keeps 10 mantissa bits to bf16's 7 (as HyperQwen notes for this model's state).
+
+## Vision encoder
+
+Numerical agreement with llama.cpp: both encoders on the same raw 448x448 checkerboard (784 patches, position
+embeddings interpolated from 48x48 to 28x28), sum of each checkpoint tensor:
+
+| Checkpoint | llama.cpp (`llama-mtmd-debug -p encode -n 448 --image cb`) | klein (`klein vision-debug -pp 448`) |
+| --- | ---: | ---: |
+| patch embedding + bias | 23345.943 | 23343.399 |
+| + position embeddings | 23648.951 | 23649.116 |
+| layer 0 output | 56597.652 | 56598.149 |
+| layer 13 output | 10203.045 | 10203.294 |
+| layer 26 output | 824895.750 | 824902.045 |
+| post layer norm | -298.317 | -298.320 |
+| image embeddings (output) | 2329.092 | 2329.145 |
+
+The first row differs most because llama.cpp computes the patch convolution in f16, klein in f32.
+
+Encoding time (IQ4_XS model, 262K context, weights streamed from RAM): a 640x480 photo (300 tokens) 123-255 ms,
+a 929x861 screenshot (783 tokens) 367-430 ms, including borrowing and returning VRAM. Decoding after an image runs
+at the usual speed (15.4 tok/s on the first answer about the photo, 8K context).
+
+Greedy answers to the same two images and prompts from `klein serve` and `llama-server` (both `--mmproj`,
+`tests/bench/vision_compare.py`) agree word for word for the first ~30 tokens of the description and then differ in
+phrasing ("Below the headline" / "Below the main headline"), as greedy decoding does after a near-tie.

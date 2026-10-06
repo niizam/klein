@@ -16,6 +16,24 @@ klein run -m Qwen3.8-27B-UD-IQ4_XS.gguf -p "Prove that sqrt(2) is irrational." -
 `run` uses the Qwen chat format with thinking off by default (`--think` turns it on) and greedy sampling unless
 `--temp` is given. Speed statistics go to stderr.
 
+## Images
+
+With the vision encoder (`mmproj-BF16.gguf` from Unsloth's Qwen3.8-27B repository), klein reads images:
+
+```powershell
+klein run -m Qwen3.8-27B-UD-IQ4_XS.gguf --mmproj mmproj-BF16.gguf --image photo.jpg -p "What is in this picture?"
+klein serve -m Qwen3.8-27B-UD-IQ4_XS.gguf --mmproj mmproj-BF16.gguf
+```
+
+- `--image FILE` can be given several times. PNG, JPEG, BMP, GIF (first frame), TGA, PSD, HDR and PNM are read.
+- Each image becomes one token per 32x32 pixels after resizing, between 8 and `--image-max-tokens` (default 1024,
+  about one megapixel). A 640x480 photo is 300 tokens.
+- The encoder's weights (0.87 GiB) stay in RAM. For each image klein borrows VRAM from a few FFN blocks, runs the
+  encoder on the GPU (about 0.1-0.4 s), and gives the VRAM back, so text-only chats lose no speed.
+- Server: send images as OpenAI `image_url` content items with `data:` URLs (base64). Remote `http(s)` URLs are
+  refused: klein does not fetch anything. `/v1/models` lists `"modalities": ["text", "image"]`.
+- Chat page: the image button, paste or drag-and-drop attaches images; they are downscaled in the browser first.
+
 ## Server (OpenAI-compatible)
 
 ```powershell

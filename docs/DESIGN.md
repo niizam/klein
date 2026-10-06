@@ -160,6 +160,23 @@ first node, so kinds built in the same memory would keep invalidating each other
 fell from 111,411 to 10,059, but decode only got 3-4% faster: launches overlap GPU work anyway, and the time left is
 waiting at the GPU->CPU hand-offs while the CPU computes the spilled weights (see BENCHMARKS.md).
 
+### 8. Images (`src/vision.*`, `src/image.*`, cells in `Engine`)
+
+The vision encoder (mmproj GGUF, `qwen3vl_merger`) is a 27-layer ViT over 16x16 patches with 2D M-RoPE and learned
+position embeddings (bilinearly resized from a 48x48 grid), followed by a 2x2 patch merger into the 5,120-wide
+embedding space. klein ports llama.cpp's graph and preprocessing (Pillow-compatible bicubic resize, Qwen's
+"smart resize" to multiples of 32 pixels with aspect-preserving padding).
+
+- **No VRAM between images.** The encoder's BF16 weights live in pinned RAM. The scheduler streams each matrix to
+  the GPU when an image is encoded, and the activation memory is borrowed from FFN blocks (the elastic mechanism of
+  section 5) and returned afterwards.
+- **Cells.** The engine's input is a sequence of cells: a token, or an embedding row, each with its own M-RoPE
+  position (t, y, x). An image's cells share t, and their y/x follow the grid. The text after an image continues at
+  t + max(grid width, grid height). The KV cache is indexed by cell, the rotary position by (t, y, x). Passes with
+  image cells take embedding rows: text rows are dequantized from `token_embd` on the host.
+- **Prompt reuse with images.** Image cells carry pseudo token ids derived from the image's pixels, so a follow-up
+  turn about the same image reuses the cache like text does.
+
 ## Correctness checks
 
 - **Tokenizer.** Identical token ids to llama.cpp on code, CJK, emoji, numbers, special tokens and the full GPL
@@ -171,7 +188,9 @@ waiting at the GPU->CPU hand-offs while the CPU computes the spilled weights (se
   noise of the reference.
 - **Speculative decoding.** `check-spec` (above).
 - **Server.** `tests/server/smoke.py`: chat, streaming with reasoning, typed tool calls, prompt reuse,
-  `/completion`.
+  `/completion`. `tests/server/vision_smoke.py`: image answers, image tokens in usage, image reuse across turns.
+- **Vision encoder.** `klein vision-debug` against llama.cpp's `llama-mtmd-debug` on the same raw checkerboard:
+  every checkpoint sum agrees within 0.01% (final embeddings 2329.14 vs 2329.09).
 
 ## Code map
 
@@ -186,6 +205,8 @@ waiting at the GPU->CPU hand-offs while the CPU computes the spilled weights (se
 | `src/tokenizer.*`, `src/chat.*`, `src/sampler.*` | BPE tokenizer, Qwen3.8 chat template + output parser, sampler |
 | `src/server.*` | OpenAI-compatible HTTP server |
 | `src/transcode.*` | IQ4_XS -> IQ4_NL |
+| `src/image.*`, `src/vision.*` | image decoding and preprocessing, the Qwen3-VL vision encoder |
+| `src/web/index.html` | the chat page (compiled into `klein.exe`, served at `/`) |
 | `tools/` | `klein-tokenize`, `klein-cpubench`, `klein-chat-test` |
 
 ## Ideas not yet done

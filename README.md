@@ -56,6 +56,9 @@ build\klein.exe run -m models\Qwen3.8-27B-UD-IQ4_XS.gguf -p "Write a haiku about
 build\klein.exe serve -m models\Qwen3.8-27B-UD-IQ4_XS.gguf
 ```
 
+For images, also download `mmproj-BF16.gguf` from the same repository and add `--mmproj mmproj-BF16.gguf`; then
+attach pictures in the chat page or send them to the API. Details: [docs/USAGE.md](docs/USAGE.md#images).
+
 Point any OpenAI-compatible app at `http://127.0.0.1:8080/v1`. Streaming, thinking (`reasoning_content`, effort
 low/medium/high/none) and tool calls are supported. Commands, options and the API: [docs/USAGE.md](docs/USAGE.md).
 
@@ -67,9 +70,9 @@ The planner adapts to the VRAM it finds free.
 
 ## Status
 
-Working and measured: the qwen35 architecture (dense Qwen3.5/3.6/3.8), GGUF quants supported by ggml, CUDA
-GPUs (Ampere and newer by default), Windows. Not supported: images (the vision tower), MoE Qwen variants,
-several concurrent requests, Linux builds (not tried).
+Working and measured: the qwen35 architecture (dense Qwen3.5/3.6/3.8), images (Qwen3-VL vision encoder), GGUF
+quants supported by ggml, CUDA GPUs (Ampere and newer by default), Windows. Not supported: video, MoE Qwen
+variants, several concurrent requests, Linux builds (not tried).
 
 ## License
 
