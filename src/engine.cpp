@@ -95,7 +95,6 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     // --- scheduler ---
     ggml_backend_t backends[2] = {gpu_, cpu_};
     sched_ = ggml_backend_sched_new(backends, nullptr, 2, 32768, false, true);
-    meta_buf_.resize(ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false));
     mtp_logits_.resize(hp.n_vocab);
 
     warmup();
@@ -171,7 +170,11 @@ void Engine::run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_
     const int ring = mtp && mtp_cells(state_->cfg()) < n_ctx ? mtp_cells(state_->cfg()) : 0;
     const int n_kv = ring ? std::min(ring, padded_n_kv(a.pos0 + a.n, n_ctx)) : padded_n_kv(a.pos0 + a.n, n_ctx);
 
-    ggml_init_params ip{meta_buf_.size(), meta_buf_.data(), true};
+    // One metadata buffer per graph kind: ggml-cuda caches CUDA graphs by the address of each split's first node, so
+    // kinds built in the same memory would keep invalidating each other's cached graphs.
+    std::vector<uint8_t>& meta = meta_buf_[(mtp ? 2 : 0) + (a.n >= 32 ? 1 : 0)];
+    if (meta.empty()) meta.resize(ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false));
+    ggml_init_params ip{meta.size(), meta.data(), true};
     ggml_context* ctx = ggml_init(ip);
     FwdGraph g = mtp ? build_mtp_graph(ctx, *model_, *state_, a.n, n_kv, a.n_out, h_src, h_dst)
                      : build_main_graph(ctx, *model_, *state_, a.n, n_kv, a.n_out);

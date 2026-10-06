@@ -87,7 +87,7 @@ private:
     std::unique_ptr<State> state_;
     Tokenizer tok_;
     Plan plan_;
-    std::vector<uint8_t> meta_buf_;
+    std::vector<uint8_t> meta_buf_[4];   // graph metadata per kind: main/MTP x small/large batch
     bool mtp_ready_ = false;            // MTP logits for the next draft are in mtp_logits_
     bool kv_mapped_ = false;            // host KV cache is mapped into the GPU address space (zero-copy)
     std::vector<float> mtp_logits_;
