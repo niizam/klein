@@ -26,6 +26,7 @@ From PowerShell in the repository:
 scripts\build.ps1                              # configure (first time) and build everything into build\
 scripts\build.ps1 -Targets klein               # only the main executable
 scripts\build.ps1 -Jobs 8 -BuildDir build-dbg -Config RelWithDebInfo
+scripts\build.ps1 -BuildDir build-release -CudaArch "86-real;89-real;120-real"   # RTX 30, 40 and 50 series
 ```
 
 `scripts\build.ps1` enters the Visual Studio developer environment, configures CMake with Ninja and builds at
@@ -59,4 +60,17 @@ build\klein.exe ppl -m MODEL.gguf --kld-base base.bin --ppl-batch 512
 
 # server end to end (start `klein serve` first)
 python tests\server\smoke.py http://127.0.0.1:8080
+python tests\server\vision_smoke.py http://127.0.0.1:8080 photo.jpg   # with --mmproj
 ```
+
+## Release packages
+
+```powershell
+scripts\build.ps1 -BuildDir build-release -CudaArch "86-real;89-real;120-real"
+scripts\package.ps1 -Version v0.1.0   # -> dist\klein-v0.1.0-win-cuda13-x64.zip, dist\cuda13-runtime-win-x64.zip
+```
+
+The klein zip holds the executables, README, docs and licenses. The second zip holds the two NVIDIA cuBLAS DLLs that
+`klein.exe` loads (`cublas64_13.dll`, `cublasLt64_13.dll`; redistributable under the CUDA EULA). The CUDA runtime
+itself is linked statically. The executables need the Microsoft Visual C++ Redistributable 2015-2022 (x64) and a CPU
+with AVX2 (`GGML_NATIVE` on the build machine selects AVX2/FMA/F16C).

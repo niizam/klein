@@ -1,11 +1,13 @@
 # Builds klein with Ninja + MSVC + CUDA on Windows.
-# Usage: scripts\build.ps1 [-BuildDir build] [-Jobs 4] [-Targets "klein klein-bench"] [-Config Release]
+# Usage: scripts\build.ps1 [-BuildDir build] [-Jobs 4] [-Targets "klein klein-tokenize"] [-Config Release]
+#                          [-CudaArch "86-real;89-real;120-real"]   (default 86-real: RTX 30 series)
 # Runs at BelowNormal priority so the desktop stays responsive while nvcc compiles.
 param(
     [string]$BuildDir = "build",
     [int]$Jobs = 4,
     [string]$Targets = "",
-    [string]$Config = "Release"
+    [string]$Config = "Release",
+    [string]$CudaArch = ""
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -17,7 +19,9 @@ try { (Get-Process -Id $PID).PriorityClass = 'BelowNormal' } catch {}
 
 $bd = Join-Path $root $BuildDir
 if (-not (Test-Path (Join-Path $bd "build.ninja"))) {
-    cmake -S $root -B $bd -G Ninja "-DCMAKE_BUILD_TYPE=$Config"
+    $arch = @()
+    if ($CudaArch) { $arch = @("-DCMAKE_CUDA_ARCHITECTURES=$CudaArch") }
+    cmake -S $root -B $bd -G Ninja "-DCMAKE_BUILD_TYPE=$Config" @arch
     if ($LASTEXITCODE -ne 0) { exit 1 }
 }
 $t = @()
