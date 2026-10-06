@@ -23,6 +23,11 @@ klein serve -m Qwen3.8-27B-UD-IQ4_XS.gguf                    # http://127.0.0.1:
 klein serve -m Qwen3.8-27B-UD-IQ4_XS.gguf --host 0.0.0.0 --api-key SECRET --port 8080
 ```
 
+Open **http://127.0.0.1:8080/** in a browser for the built-in chat page (`src/web/index.html`, compiled into
+`klein.exe`): streaming answers, a thinking switch (Off/Low/Medium/High) with the reasoning folded away, code blocks
+with a copy button, tables, and the speed of each answer. Conversations are kept in the browser. With
+`--api-key KEY`, open `http://HOST:PORT/?key=KEY` once; the page remembers the key.
+
 A non-loopback `--host` is refused without `--api-key`. With a key, every endpoint except `/health` needs
 `Authorization: Bearer <key>` (or `x-api-key: <key>`).
 
@@ -32,6 +37,7 @@ A non-loopback `--host` is refused without `--api-key`. With a key, every endpoi
 | `POST /v1/completions` | raw prompt, no template |
 | `POST /completion` | llama.cpp-style (`prompt`, `n_predict`), returns `timings` |
 | `GET /v1/models`, `GET /models` | the loaded model and its context length |
+| `GET /` | the chat page |
 | `GET /health` | `{"status":"ok"}` |
 
 ### Chat completions

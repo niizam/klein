@@ -42,6 +42,12 @@ add_library(klein_core STATIC
     src/chat.cpp
     src/server.cpp)
 target_include_directories(klein_core PUBLIC src third_party/json third_party/httplib)
+
+# The chat page (src/web/index.html) is compiled into the binary and served at "/".
+include(cmake/embed.cmake)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/web/index.html)
+embed_file(${CMAKE_CURRENT_SOURCE_DIR}/src/web/index.html ${CMAKE_CURRENT_BINARY_DIR}/generated/index_html.h klein_index_html)
+target_include_directories(klein_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 if (WIN32)
     target_link_libraries(klein_core PUBLIC ws2_32)
     target_compile_definitions(klein_core PUBLIC _WIN32_WINNT=0x0A00)

@@ -53,6 +53,8 @@ public:
     ggml_tensor* mtp_hidden() const { return mtp_hidden_; }
 
     size_t kv_bytes() const { return kv_bytes_; }
+    // KV cache in RAM that the GPU reads directly (mapped pinned memory); false for VRAM or plain RAM.
+    bool kv_mapped() const { return kv_mapped_; }
     size_t recurrent_bytes() const { return rec_bytes_; }
 
     int n_past = 0;      // tokens in the main model's cache
@@ -71,6 +73,7 @@ private:
     std::vector<ggml_tensor*> k_, v_, conv_, ssm_;
     std::vector<ggml_tensor*> k_host_, v_host_;
     std::vector<ggml_tensor*> ssm_snap_;
+    bool kv_mapped_ = false;
     ggml_tensor* hidden_ = nullptr;
     ggml_tensor* mtp_hidden_ = nullptr;
     size_t kv_bytes_ = 0, rec_bytes_ = 0;

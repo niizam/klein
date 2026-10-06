@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "chat.h"
+#include "index_html.h"
 #include "common.h"
 #include "engine.h"
 #include "sampler.h"
@@ -600,7 +601,7 @@ int run_server(Engine& engine, const ServerOptions& opt) {
             res.set_header("Access-Control-Max-Age", "86400");
             return httplib::Server::HandlerResponse::Handled;
         }
-        if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
+        if (req.path == "/health" || req.path == "/") return httplib::Server::HandlerResponse::Unhandled;
         if (!opt.api_key.empty() && !authorized(req, opt.api_key)) {
             send_error(res, 401, "Incorrect API key provided.");
             return httplib::Server::HandlerResponse::Handled;
@@ -608,6 +609,11 @@ int run_server(Engine& engine, const ServerOptions& opt) {
         return httplib::Server::HandlerResponse::Unhandled;
     });
     svr.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) { apply_cors(req, res); });
+
+    // The chat page (index.html, compiled in). It calls the API from the same origin.
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(reinterpret_cast<const char*>(klein_index_html), klein_index_html_len, "text/html; charset=utf-8");
+    });
 
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");

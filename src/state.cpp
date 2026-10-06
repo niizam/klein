@@ -95,6 +95,12 @@ State::State(const Model& model, const StateConfig& cfg, ggml_backend_buffer_typ
         size_t size = 0;
         for (auto t : ts) size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
+        if (!buf && !ggml_backend_buft_is_host(buft) && buft != gpu_buft) {
+            // Pinned (page-locked) RAM can fail when the OS cannot lock that much right now. Plain RAM still works:
+            // attention then runs on the CPU for small batches (slower decoding at long contexts).
+            KLOG_WARN("cannot pin %.2f GiB of RAM for the %s; using ordinary RAM (slower attention)", size / GiB, what);
+            buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        }
         if (!buf) fatal("cannot allocate %.2f GiB for the %s", size / GiB, what);
         ggml_tallocr ta = ggml_tallocr_new(buf);
         for (auto t : ts) ggml_tallocr_alloc(&ta, t);
@@ -106,6 +112,7 @@ State::State(const Model& model, const StateConfig& cfg, ggml_backend_buffer_typ
         // If that buffer is device-visible (mapped pinned memory), add a plain host view of the same bytes.
         ggml_backend_buffer_t kvbuf = buffers_.back();
         if (!ggml_backend_buffer_is_host(kvbuf)) {
+            kv_mapped_ = true;
             ggml_backend_buffer_t view = ggml_backend_cpu_buffer_from_ptr(ggml_backend_buffer_get_base(kvbuf), ggml_backend_buffer_get_size(kvbuf));
             buffers_.push_back(view);
             k_host_.assign(n_all, nullptr);

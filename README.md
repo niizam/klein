@@ -52,7 +52,7 @@ hf download unsloth/Qwen3.8-27B-GGUF --include "*UD-IQ4_XS*" --local-dir models
 # chat in the terminal
 build\klein.exe run -m models\Qwen3.8-27B-UD-IQ4_XS.gguf -p "Write a haiku about GPUs."
 
-# OpenAI-compatible server on http://127.0.0.1:8080/v1
+# chat page on http://127.0.0.1:8080/ and OpenAI-compatible API on http://127.0.0.1:8080/v1
 build\klein.exe serve -m models\Qwen3.8-27B-UD-IQ4_XS.gguf
 ```
 

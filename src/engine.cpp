@@ -181,7 +181,7 @@ void Engine::run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_
 
     ggml_backend_sched_reset(sched_);
     // With the KV cache in RAM, small batches attend on the CPU (copying the cache to the GPU would cost more).
-    if (state_->cfg().kv_place == Place::Host && !kv_mapped_ && a.n < 32) {
+    if (state_->cfg().kv_place == Place::Host && !state_->kv_mapped() && a.n < 32) {
         for (ggml_tensor* t : g.attn_nodes) ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
     }
     if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) fatal("failed to allocate the compute graph");
