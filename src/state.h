@@ -17,6 +17,7 @@ struct StateConfig {
     ggml_type type_v = GGML_TYPE_Q8_0;
     Place kv_place = Place::Gpu;
     int n_snapshots = 1;      // recurrent state slots: 1 + max draft tokens (for rollback after rejected drafts)
+    ggml_type snap_type = GGML_TYPE_BF16;  // storage of the rollback snapshots (slots 1..); slot 0 is always f32
     int max_batch = 512;      // largest batch a forward pass takes (bounds the hidden-state buffer)
     int mtp_window = 16384;   // MTP head attention window (ring buffer cells, kept in VRAM)
 };
@@ -41,9 +42,11 @@ public:
     // reading it in small pieces across PCIe. Small batches use k()/v(), mapped into the GPU (zero-copy).
     ggml_tensor* k_bulk(int il) const { return k_host_.empty() || !k_host_[il] ? k_[il] : k_host_[il]; }
     ggml_tensor* v_bulk(int il) const { return v_host_.empty() || !v_host_[il] ? v_[il] : v_host_[il]; }
-    // Recurrent state per DeltaNet layer: [row, n_snapshots], slot 0 = current, slot s = s tokens back.
+    // Recurrent state per DeltaNet layer. conv: [row, n_snapshots] f32, slot 0 = current, slot s = s tokens back.
+    // ssm: [row, 1] f32 (current); ssm_snap: [row, n_snapshots - 1] in snap_type, row s - 1 = s tokens back.
     ggml_tensor* conv(int il) const { return conv_[il]; }
     ggml_tensor* ssm(int il) const { return ssm_[il]; }
+    ggml_tensor* ssm_snap(int il) const { return ssm_snap_.empty() ? nullptr : ssm_snap_[il]; }
     // Final-norm hidden states of the last main forward pass: [n_embd, max_batch].
     ggml_tensor* hidden() const { return hidden_; }
     // Final-norm hidden states written by MTP passes (input of the next chained draft): [n_embd, max_batch].
@@ -67,6 +70,7 @@ private:
     std::vector<ggml_backend_buffer_t> buffers_;
     std::vector<ggml_tensor*> k_, v_, conv_, ssm_;
     std::vector<ggml_tensor*> k_host_, v_host_;
+    std::vector<ggml_tensor*> ssm_snap_;
     ggml_tensor* hidden_ = nullptr;
     ggml_tensor* mtp_hidden_ = nullptr;
     size_t kv_bytes_ = 0, rec_bytes_ = 0;

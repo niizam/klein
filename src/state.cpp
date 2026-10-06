@@ -29,7 +29,9 @@ size_t state_mtp_kv_bytes(const HParams& hp, const StateConfig& cfg) {
 
 size_t state_recurrent_bytes(const HParams& hp, const StateConfig& cfg) {
     const int n_rec = hp.n_layer - hp.n_attn_layers();
-    return (size_t) n_rec * (size_t) (conv_row(hp) + ssm_row(hp)) * sizeof(float) * (size_t) cfg.n_snapshots;
+    const size_t conv = (size_t) conv_row(hp) * sizeof(float) * (size_t) cfg.n_snapshots;
+    const size_t ssm = (size_t) ssm_row(hp) * (sizeof(float) + ggml_type_size(cfg.snap_type) * (size_t) (cfg.n_snapshots - 1));
+    return (size_t) n_rec * (conv + ssm);
 }
 
 State::State(const Model& model, const StateConfig& cfg, ggml_backend_buffer_type_t gpu_buft, ggml_backend_buffer_type_t host_buft)
@@ -41,7 +43,7 @@ State::State(const Model& model, const StateConfig& cfg, ggml_backend_buffer_typ
     conv_.assign(n_all, nullptr);
     ssm_.assign(n_all, nullptr);
 
-    ggml_init_params ip{ggml_tensor_overhead() * (size_t) (n_all * 6 + 8), nullptr, true};
+    ggml_init_params ip{ggml_tensor_overhead() * (size_t) (n_all * 7 + 8), nullptr, true};
     ctx_ = ggml_init(ip);
 
     std::vector<ggml_tensor*> kv_tensors, gpu_tensors;
@@ -66,7 +68,13 @@ State::State(const Model& model, const StateConfig& cfg, ggml_backend_buffer_typ
             kv_tensors.push_back(v_[il]);
         } else {
             conv_[il] = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, conv_row(hp), cfg.n_snapshots);
-            ssm_[il] = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, ssm_row(hp), cfg.n_snapshots);
+            ssm_[il] = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, ssm_row(hp), 1);
+            if (cfg.n_snapshots > 1) {
+                if (ssm_snap_.empty()) ssm_snap_.assign(n_all, nullptr);
+                ssm_snap_[il] = ggml_new_tensor_2d(ctx_, cfg.snap_type, ssm_row(hp), cfg.n_snapshots - 1);
+                ggml_format_name(ssm_snap_[il], "cache_ssm_snap_l%d", il);
+                gpu_tensors.push_back(ssm_snap_[il]);
+            }
             ggml_format_name(conv_[il], "cache_conv_l%d", il);
             ggml_format_name(ssm_[il], "cache_ssm_l%d", il);
             gpu_tensors.push_back(conv_[il]);
@@ -137,6 +145,7 @@ void State::clear(ggml_backend_t gpu) {
         if (conv_[il]) {
             ggml_backend_tensor_memset(conv_[il], 0, 0, ggml_nbytes(conv_[il]));
             ggml_backend_tensor_memset(ssm_[il], 0, 0, ggml_nbytes(ssm_[il]));
+            if (!ssm_snap_.empty() && ssm_snap_[il]) ggml_backend_tensor_memset(ssm_snap_[il], 0, 0, ggml_nbytes(ssm_snap_[il]));
         }
     }
     n_past = 0;
@@ -146,19 +155,21 @@ void State::clear(ggml_backend_t gpu) {
 void State::rollback_recurrent(ggml_backend_t gpu, int s) {
     if (s <= 0) return;
     KLEIN_ASSERT(s < cfg_.n_snapshots);
-    // One small graph of device-side copies: slot s -> slot 0 for every DeltaNet layer.
+    // One small graph of device-side copies into the current slot of every DeltaNet layer.
     ggml_init_params ip{ggml_tensor_overhead() * 512 + ggml_graph_overhead(), nullptr, true};
     ggml_context* c = ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph(c);
+    auto copy = [&](ggml_tensor* from, size_t from_off, ggml_tensor* to, int64_t n) {
+        ggml_tensor* src = ggml_view_1d(c, from, n, from_off);
+        ggml_tensor* dst = ggml_view_1d(c, to, n, 0);
+        ggml_backend_view_init(src);
+        ggml_backend_view_init(dst);
+        ggml_build_forward_expand(gf, ggml_cpy(c, src, dst));
+    };
     for (size_t il = 0; il < conv_.size(); ++il) {
-        for (ggml_tensor* t : {conv_[il], ssm_[il]}) {
-            if (!t) continue;
-            ggml_tensor* src = ggml_view_1d(c, t, t->ne[0], (size_t) s * t->nb[1]);
-            ggml_tensor* dst = ggml_view_1d(c, t, t->ne[0], 0);
-            ggml_backend_view_init(src);
-            ggml_backend_view_init(dst);
-            ggml_build_forward_expand(gf, ggml_cpy(c, src, dst));
-        }
+        if (!conv_[il]) continue;
+        copy(conv_[il], (size_t) s * conv_[il]->nb[1], conv_[il], conv_[il]->ne[0]);
+        copy(ssm_snap_[il], (size_t) (s - 1) * ssm_snap_[il]->nb[1], ssm_[il], ssm_[il]->ne[0]);
     }
     ggml_backend_graph_compute(gpu, gf);
     ggml_free(c);

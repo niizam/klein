@@ -81,6 +81,7 @@ Args parse(int argc, char** argv) {
         else if (s == "--no-repack") a.ec.cpu_repack = false;
         else if (s == "--kv-cpu-attn") a.ec.kv_zero_copy = false;
         else if (s == "--mtp-window") a.ec.mtp_window = std::stoi(next());
+        else if (s == "--snap-type") a.ec.snap_type = next();
         else if (s == "-p") a.prompt = next();
         else if (s == "-f") a.file = next();
         else if (s == "-n") a.n_predict = std::stoi(next());

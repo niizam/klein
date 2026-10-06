@@ -31,6 +31,7 @@ struct EngineConfig {
     bool cpu_repack = true;        // repacked CPU copies of spilled weights (faster small-batch decode, more RAM)
     bool kv_zero_copy = true;      // host KV cache read by the GPU over PCIe (else: attention on the CPU)
     int mtp_window = 16384;        // MTP head attention window (positions)
+    std::string snap_type = "bf16"; // rollback snapshot storage: bf16 (half the VRAM) or f32
 };
 
 struct GenStats {

@@ -167,9 +167,15 @@ struct Builder {
                                         ggml_row_size(r->type, attn_elems), 0);
         const int n_written = std::min<int>(n_tokens, K);
         const int64_t D = S * S * Hv;
-        ggml_tensor* snaps = ggml_view_2d(ctx, r, D, n_written, ggml_row_size(r->type, D), ggml_row_size(r->type, attn_elems));
-        ggml_tensor* dst = ggml_view_2d(ctx, ss_all, D, n_written, ss_all->nb[1], 0);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, snaps, dst));
+        // slot 0 (the state after the last token) stays f32; older slots are rollback snapshots (stored in snap_type)
+        ggml_tensor* cur_state = ggml_view_1d(ctx, r, D, ggml_row_size(r->type, attn_elems));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, cur_state, ggml_view_1d(ctx, ss_all, D, 0)));
+        if (n_written > 1) {
+            ggml_tensor* snap = st.ssm_snap(il);
+            ggml_tensor* src = ggml_view_2d(ctx, r, D, n_written - 1, ggml_row_size(r->type, D),
+                                            ggml_row_size(r->type, attn_elems + D));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src, ggml_view_2d(ctx, snap, D, n_written - 1, snap->nb[1], 0)));
+        }
 
         // gated RMS norm, then output projection
         ggml_tensor* zz = ggml_reshape_4d(ctx, z, S, Hv, n_tokens, 1);
