@@ -29,6 +29,7 @@ struct Plan {
     size_t kv_bytes = 0, rec_bytes = 0;
     int n_spilled_blocks = 0;
     std::vector<int> spilled_layers;
+    std::vector<int> block_order;  // every decoder layer's FFN block, cheapest to run on the CPU first
     double est_cpu_ms = 0.0;       // estimated CPU time per single-token step for the spilled weights
     std::string summary() const;
 };

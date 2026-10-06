@@ -98,6 +98,11 @@ Model::Model(const ModelOptions& opt) : cpu_repack_(opt.cpu_repack) {
 }
 
 Model::~Model() {
+    for (auto& b : blocks_) {
+        if (b.gpu) ggml_backend_buffer_free(b.gpu);
+        if (b.host) ggml_backend_buffer_free(b.host);
+        if (b.alt) ggml_backend_buffer_free(b.alt);
+    }
     for (auto b : buffers_) ggml_backend_buffer_free(b);
     if (ctx_) ggml_free(ctx_);
 }
@@ -158,118 +163,225 @@ size_t Model::bytes(Place p) const {
 
 size_t Model::total_bytes() const { return bytes(Place::Gpu) + bytes(Place::Host); }
 
-void Model::load(ggml_backend_buffer_type_t gpu_buft, ggml_backend_buffer_type_t host_buft) {
+static ggml_backend_buffer_type_t cpu_repack_buft() {
+    static ggml_backend_buffer_type_t repack = [] {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        auto reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        ggml_backend_buffer_type_t r = nullptr;
+        if (get_extra) {
+            for (auto p = get_extra(cpu_dev); p && *p; ++p) {
+                if (std::strcmp(ggml_backend_buft_name(*p), "CPU_REPACK") == 0) r = *p;
+            }
+        }
+        if (!r) KLOG_WARN("no repacked CPU layout available; spilled weights use the plain CPU kernels");
+        return r;
+    }();
+    return repack;
+}
+
+// Would the repack buffer accept a matrix of this type and shape for a small-batch mul_mat?
+static bool repackable(ggml_backend_buffer_type_t repack, ggml_type type, const int64_t* ne) {
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_init_params ip{ggml_tensor_overhead() * 4, nullptr, true};
+    ggml_context* c = ggml_init(ip);
+    ggml_tensor* w = ggml_new_tensor_2d(c, type, ne[0], ne[1]);
+    ggml_tensor* x = ggml_new_tensor_2d(c, GGML_TYPE_F32, ne[0], 4);
+    ggml_tensor* y = ggml_mul_mat(c, w, x);
+    ggml_backend_buffer_t tb = ggml_backend_buft_alloc_buffer(repack, 0x100);
+    w->buffer = tb;
+    const bool ok = ggml_backend_dev_supports_op(cpu_dev, y);
+    w->buffer = nullptr;
+    ggml_backend_buffer_free(tb);
+    ggml_free(c);
+    return ok;
+}
+
+static size_t block_size(const FfnBlock& b, ggml_backend_buffer_type_t buft) {
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t size = 0;
+    for (const WeightInfo* w : b.ws) size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, w->t), align);
+    return size;
+}
+
+void Model::bind(FfnBlock& b, ggml_backend_buffer_t buf) {
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    char* base = (char*) ggml_backend_buffer_get_base(buf);
+    size_t off = 0;
+    for (WeightInfo* w : b.ws) {
+        w->t->buffer = nullptr;
+        w->t->data = nullptr;
+        if (ggml_backend_tensor_alloc(buf, w->t, base + off) != GGML_STATUS_SUCCESS) fatal("cannot place %s", ggml_get_name(w->t));
+        off += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, w->t), align);
+    }
+}
+
+void Model::load(ggml_backend_buffer_type_t gpu_buft, ggml_backend_buffer_type_t host_buft, const std::vector<int>& block_order,
+                 int n_spilled, int n_elastic) {
     const double t0 = now_ms();
-    auto alloc_group = [&](Place p, ggml_backend_buffer_type_t buft) -> ggml_backend_buffer_t {
+    gpu_buft_ = gpu_buft;
+
+    // FFN blocks, in spill order
+    std::unordered_map<int, int> rank;
+    blocks_.assign(block_order.size(), FfnBlock{});
+    for (size_t i = 0; i < block_order.size(); ++i) {
+        rank[block_order[i]] = (int) i;
+        blocks_[i].layer = block_order[i];
+    }
+    std::unordered_map<const ggml_tensor*, bool> in_block;
+    for (auto& w : weights) {
+        if (w.layer < 0 || w.layer >= hp.n_layer) continue;
+        const Layer& L = layers[w.layer];
+        if (w.t != L.ffn_gate && w.t != L.ffn_up && w.t != L.ffn_down) continue;
+        FfnBlock& b = blocks_[rank.at(w.layer)];
+        b.ws.push_back(&w);
+        b.bytes += ggml_nbytes(w.t);
+        in_block[w.t] = true;
+    }
+    n_spilled = std::min<int>(n_spilled, (int) blocks_.size());
+    const int n_host_copy = std::min<int>(n_spilled + std::max(0, n_elastic), (int) blocks_.size());
+    n_host_ = n_spilled;
+
+    // everything that is not an FFN block: one buffer per placement
+    auto alloc_group = [&](Place p, ggml_backend_buffer_type_t buft) {
         size_t size = 0;
         const size_t align = ggml_backend_buft_get_alignment(buft);
         for (const auto& w : weights)
-            if (w.place == p) size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, w.t), align);
-        if (size == 0) return nullptr;
+            if (w.place == p && !in_block.count(w.t)) size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, w.t), align);
+        if (size == 0) return;
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
         if (!buf) fatal("cannot allocate %.2f GiB of %s memory for weights", size / GiB, ggml_backend_buft_name(buft));
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_tallocr ta = ggml_tallocr_new(buf);
         for (auto& w : weights)
-            if (w.place == p) ggml_tallocr_alloc(&ta, w.t);
+            if (w.place == p && !in_block.count(w.t)) ggml_tallocr_alloc(&ta, w.t);
         buffers_.push_back(buf);
-        return buf;
     };
     alloc_group(Place::Gpu, gpu_buft);
     alloc_group(Place::Host, host_buft);
 
-    // Read in file order, through a staging buffer for device tensors.
-    std::vector<WeightInfo*> order;
-    for (auto& w : weights) order.push_back(&w);
-    std::sort(order.begin(), order.end(), [](const WeightInfo* a, const WeightInfo* b) {
-        if (a->src != b->src) return a->src < b->src;
-        return a->src->tensor_file_offset(a->src_meta) < b->src->tensor_file_offset(b->src_meta);
-    });
     std::vector<uint8_t> staging(64u << 20);
-    size_t done = 0;
-    for (WeightInfo* w : order) {
+    auto read_to_tensor = [&](WeightInfo* w) {
         const size_t n = ggml_nbytes(w->t);
         if (ggml_backend_buffer_is_host(w->t->buffer)) {
             w->src->read_tensor_data(w->src_meta, w->t->data, 0, n);
-        } else {
-            for (size_t off = 0; off < n; off += staging.size()) {
-                const size_t len = std::min(staging.size(), n - off);
-                w->src->read_tensor_data(w->src_meta, staging.data(), off, len);
-                ggml_backend_tensor_set(w->t, staging.data(), off, len);
+            return;
+        }
+        for (size_t off = 0; off < n; off += staging.size()) {
+            const size_t len = std::min(staging.size(), n - off);
+            w->src->read_tensor_data(w->src_meta, staging.data(), off, len);
+            ggml_backend_tensor_set(w->t, staging.data(), off, len);
+        }
+    };
+
+    size_t done = 0;
+    for (auto& w : weights) {
+        if (in_block.count(w.t)) continue;
+        read_to_tensor(&w);
+        done += ggml_nbytes(w.t);
+    }
+    for (int i = 0; i < (int) blocks_.size(); ++i) {
+        FfnBlock& b = blocks_[i];
+        b.on_gpu = i >= n_spilled;
+        if (i < n_host_copy) {
+            b.host = ggml_backend_buft_alloc_buffer(host_buft, block_size(b, host_buft));
+            if (!b.host) fatal("cannot allocate pinned RAM for FFN block %d", b.layer);
+            ggml_backend_buffer_set_usage(b.host, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            bind(b, b.host);
+            for (WeightInfo* w : b.ws) read_to_tensor(w);
+            if (cpu_repack_) make_cpu_copies(b);
+        }
+        if (b.on_gpu) {
+            std::vector<const void*> src;
+            for (WeightInfo* w : b.ws) src.push_back(b.host ? w->t->data : nullptr);
+            b.gpu = ggml_backend_buft_alloc_buffer(gpu_buft, block_size(b, gpu_buft));
+            if (!b.gpu) fatal("cannot allocate VRAM for FFN block %d", b.layer);
+            ggml_backend_buffer_set_usage(b.gpu, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            bind(b, b.gpu);
+            for (size_t k = 0; k < b.ws.size(); ++k) {
+                if (src[k]) ggml_backend_tensor_set(b.ws[k]->t, src[k], 0, ggml_nbytes(b.ws[k]->t));
+                else read_to_tensor(b.ws[k]);
             }
         }
-        done += n;
+        for (WeightInfo* w : b.ws) w->place = b.on_gpu ? Place::Gpu : Place::Host;
+        done += b.bytes;
     }
-    if (cpu_repack_) make_cpu_copies();
-    KLOG_INFO("loaded %.2f GiB of weights in %.1f s (%.2f GiB GPU, %.2f GiB host + %.2f GiB repacked CPU copies)", done / GiB,
-              (now_ms() - t0) / 1000.0, bytes(Place::Gpu) / GiB, bytes(Place::Host) / GiB, cpu_alt_bytes / GiB);
+    KLOG_INFO("loaded %.2f GiB of weights in %.1f s (%.2f GiB GPU, %.2f GiB RAM + %.2f GiB repacked CPU copies; %d FFN blocks in RAM, %d more demotable)",
+              done / GiB, (now_ms() - t0) / 1000.0, bytes(Place::Gpu) / GiB, bytes(Place::Host) / GiB, cpu_alt_bytes / GiB, n_spilled,
+              n_host_copy - n_spilled);
 }
 
-void Model::make_cpu_copies() {
-    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    auto reg = ggml_backend_dev_backend_reg(cpu_dev);
-    auto get_extra = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
-    ggml_backend_buffer_type_t repack = nullptr;
-    if (get_extra) {
-        for (auto p = get_extra(cpu_dev); p && *p; ++p) {
-            if (std::strcmp(ggml_backend_buft_name(*p), "CPU_REPACK") == 0) repack = *p;
-        }
-    }
-    if (!repack) {
-        KLOG_WARN("no repacked CPU layout available; spilled weights use the plain CPU kernels");
-        return;
-    }
-    // Would the repack buffer accept a matrix of this type and shape for a small-batch mul_mat?
-    auto repackable = [&](ggml_type type, const int64_t* ne) {
-        ggml_init_params ip{ggml_tensor_overhead() * 4, nullptr, true};
-        ggml_context* c = ggml_init(ip);
-        ggml_tensor* w = ggml_new_tensor_2d(c, type, ne[0], ne[1]);
-        ggml_tensor* x = ggml_new_tensor_2d(c, GGML_TYPE_F32, ne[0], 4);
-        ggml_tensor* y = ggml_mul_mat(c, w, x);
-        ggml_backend_buffer_t tb = ggml_backend_buft_alloc_buffer(repack, 0x100);
-        w->buffer = tb;
-        const bool ok = ggml_backend_dev_supports_op(cpu_dev, y);
-        w->buffer = nullptr;
-        ggml_backend_buffer_free(tb);
-        ggml_free(c);
-        return ok;
-    };
-
-    struct Job {
-        WeightInfo* w;
-        ggml_tensor* alt;
-    };
-    std::vector<Job> jobs;
-    for (auto& w : weights) {
-        if (w.place != Place::Host || w.t == tok_embd || ggml_n_dims(w.t) != 2) continue;
-        const ggml_type target = w.t->type == GGML_TYPE_IQ4_XS ? GGML_TYPE_IQ4_NL : w.t->type;
-        if (!repackable(target, w.t->ne)) continue;
-        ggml_tensor* alt = ggml_new_tensor_2d(ctx_, target, w.t->ne[0], w.t->ne[1]);
-        ggml_format_name(alt, "%s.cpu", ggml_get_name(w.t));
-        jobs.push_back({&w, alt});
+void Model::make_cpu_copies(FfnBlock& b) {
+    ggml_backend_buffer_type_t repack = cpu_repack_buft();
+    if (!repack) return;
+    std::vector<std::pair<WeightInfo*, ggml_tensor*>> jobs;
+    for (WeightInfo* w : b.ws) {
+        const ggml_type target = w->t->type == GGML_TYPE_IQ4_XS ? GGML_TYPE_IQ4_NL : w->t->type;
+        if (!repackable(repack, target, w->t->ne)) continue;
+        ggml_tensor* alt = ggml_new_tensor_2d(ctx_, target, w->t->ne[0], w->t->ne[1]);
+        ggml_format_name(alt, "%s.cpu", ggml_get_name(w->t));
+        jobs.push_back({w, alt});
     }
     if (jobs.empty()) return;
     const size_t align = ggml_backend_buft_get_alignment(repack);
     size_t size = 0;
-    for (auto& j : jobs) size += GGML_PAD(ggml_backend_buft_get_alloc_size(repack, j.alt), align);
-    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(repack, size);
-    if (!buf) fatal("cannot allocate %.2f GiB for repacked CPU weights (use --no-repack)", size / GiB);
-    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    buffers_.push_back(buf);
-    ggml_tallocr ta = ggml_tallocr_new(buf);
+    for (auto& j : jobs) size += GGML_PAD(ggml_backend_buft_get_alloc_size(repack, j.second), align);
+    b.alt = ggml_backend_buft_alloc_buffer(repack, size);
+    if (!b.alt) fatal("cannot allocate %.2f GiB for repacked CPU weights (use --no-repack)", size / GiB);
+    ggml_backend_buffer_set_usage(b.alt, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_tallocr ta = ggml_tallocr_new(b.alt);
     std::vector<uint8_t> tmp;
-    for (auto& j : jobs) {
-        ggml_tallocr_alloc(&ta, j.alt);
-        const void* src = j.w->t->data;
-        if (j.w->t->type != j.alt->type) {
-            tmp.resize(ggml_nbytes(j.alt));
-            transcode_iq4xs_to_iq4nl(src, tmp.data(), ggml_nelements(j.w->t));
+    for (auto& [w, alt] : jobs) {
+        ggml_tallocr_alloc(&ta, alt);
+        const void* src = w->t->data;  // the block is bound to its RAM copy here
+        if (w->t->type != alt->type) {
+            tmp.resize(ggml_nbytes(alt));
+            transcode_iq4xs_to_iq4nl(src, tmp.data(), ggml_nelements(w->t));
             src = tmp.data();
         }
-        ggml_backend_tensor_set(j.alt, src, 0, ggml_nbytes(j.alt));  // the repack buffer converts the layout here
-        cpu_alt[j.w->t] = j.alt;
-        cpu_alt_bytes += ggml_nbytes(j.alt);
+        ggml_backend_tensor_set(alt, src, 0, ggml_nbytes(alt));  // the repack buffer converts the layout here
+        cpu_alt[w->t] = alt;
+        cpu_alt_bytes += ggml_nbytes(alt);
     }
+}
+
+size_t Model::next_demote_bytes() const {
+    if (n_host_ >= (int) blocks_.size() || !blocks_[n_host_].host) return 0;
+    return blocks_[n_host_].bytes;
+}
+
+size_t Model::next_promote_bytes() const { return n_host_ > 0 ? blocks_[n_host_ - 1].bytes : 0; }
+
+bool Model::demote() {
+    if (n_host_ >= (int) blocks_.size()) return false;
+    FfnBlock& b = blocks_[n_host_];
+    if (!b.host || !b.gpu) return false;
+    bind(b, b.host);  // the RAM copy is kept up to date (weights never change)
+    ggml_backend_buffer_free(b.gpu);
+    b.gpu = nullptr;
+    b.on_gpu = false;
+    for (WeightInfo* w : b.ws) w->place = Place::Host;
+    ++n_host_;
+    return true;
+}
+
+bool Model::promote() {
+    if (n_host_ == 0) return false;
+    FfnBlock& b = blocks_[n_host_ - 1];
+    KLEIN_ASSERT(b.host && !b.gpu);
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(gpu_buft_, block_size(b, gpu_buft_));
+    if (!buf) return false;
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<const void*> src;
+    for (WeightInfo* w : b.ws) src.push_back(w->t->data);
+    b.gpu = buf;
+    bind(b, buf);
+    for (size_t k = 0; k < b.ws.size(); ++k) ggml_backend_tensor_set(b.ws[k]->t, src[k], 0, ggml_nbytes(b.ws[k]->t));
+    b.on_gpu = true;
+    for (WeightInfo* w : b.ws) w->place = Place::Gpu;
+    --n_host_;
+    return true;
 }
 
 }  // namespace klein

@@ -63,7 +63,7 @@ struct Builder {
     // Spilled weights: small batches use the repacked CPU copy; large batches use the original, which the scheduler
     // streams to the GPU (op offload).
     ggml_tensor* mm(ggml_tensor* w, ggml_tensor* x) {
-        if (x->ne[1] < kGpuOffloadBatch) {
+        if (x->ne[1] < kGpuOffloadBatch && w->buffer && ggml_backend_buffer_is_host(w->buffer)) {
             auto it = m.cpu_alt.find(w);
             if (it != m.cpu_alt.end()) w = it->second;
         }

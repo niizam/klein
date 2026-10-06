@@ -30,6 +30,8 @@ struct EngineConfig {
     size_t compute_reserve_mb = 0; // 0 = estimate
     bool cpu_repack = true;        // repacked CPU copies of spilled weights (faster small-batch decode, more RAM)
     bool kv_zero_copy = true;      // host KV cache read by the GPU over PCIe (else: attention on the CPU)
+    int mtp_window = 16384;        // MTP head attention window (positions)
+    int base_ctx = 8192;           // VRAM is planned for prompts up to this many positions; longer ones demote FFN blocks
 };
 
 struct GenStats {
@@ -101,6 +103,11 @@ private:
         std::vector<float>* logits;
     };
     void run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_dst);
+    size_t compute_need(int n_kv) const;
+    void ensure_prefill_vram(int n_kv_end);
+    void relax_after_prefill();
+    int n_ctx_cfg_ = 0;
+    size_t margin_ = 0;
     // MTP pass over tokens at positions pos0.., reading main hidden rows [h_row0, h_row0 + n).
     void mtp_pass(const int32_t* tokens, int n, int pos0, bool from_main, int h_row0, int n_out);
     int32_t mtp_draft_token() const;

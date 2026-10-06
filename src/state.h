@@ -18,6 +18,7 @@ struct StateConfig {
     Place kv_place = Place::Gpu;
     int n_snapshots = 1;      // recurrent state slots: 1 + max draft tokens (for rollback after rejected drafts)
     int max_batch = 512;      // largest batch a forward pass takes (bounds the hidden-state buffer)
+    int mtp_window = 16384;   // MTP head attention window (ring buffer cells, kept in VRAM)
 };
 
 // The memory of one sequence: the KV cache of the full-attention layers (and of the MTP layer), the Gated
@@ -68,5 +69,7 @@ private:
 // Bytes the state needs, for planning before anything is allocated.
 size_t state_kv_bytes(const HParams& hp, const StateConfig& cfg, bool with_mtp);
 size_t state_recurrent_bytes(const HParams& hp, const StateConfig& cfg);
+size_t state_mtp_kv_bytes(const HParams& hp, const StateConfig& cfg);
+int mtp_cells(const StateConfig& cfg);
 
 }  // namespace klein

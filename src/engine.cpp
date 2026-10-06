@@ -45,29 +45,39 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     pin.state.n_ctx = std::min(cfg.n_ctx > 0 ? cfg.n_ctx : hp.n_ctx_train, hp.n_ctx_train);
     pin.state.n_snapshots = (model_->has_mtp() ? cfg.n_draft : 0) + 1;
     pin.state.max_batch = std::max(cfg.n_ubatch, cfg.n_draft + 1);
+    pin.state.mtp_window = std::max(cfg.mtp_window, 2 * pin.state.max_batch);
     pin.verify_batch = (model_->has_mtp() ? cfg.n_draft : 0) + 1;
     const std::string kvt = cfg.kv_type == "auto" ? (pin.state.n_ctx > 131072 ? "q4_0" : "q8_0") : cfg.kv_type;
     pin.state.type_k = pin.state.type_v = parse_kv_type(kvt);
     pin.kv_auto = cfg.kv_place == "auto";
     if (!pin.kv_auto) pin.state.kv_place = cfg.kv_place == "gpu" ? Place::Gpu : Place::Host;
-    if (cfg.compute_reserve_mb > 0) {
-        pin.compute_reserve = cfg.compute_reserve_mb << 20;
-    } else {
-        // activations of one prefill chunk + room for streamed (spilled) weight copies + the f16 K/V conversion
-        // that flash attention does for quantized caches during prefill
-        const size_t act = (size_t) 4 * cfg.n_ubatch * hp.n_ff * sizeof(float);
-        const size_t streamed = 160ull << 20;
-        const size_t fa_conv = (size_t) std::min(pin.state.n_ctx, 65536) * hp.kv_row() * 2 * sizeof(uint16_t);
-        pin.compute_reserve = act + streamed + fa_conv;
-    }
+    // VRAM is planned for prompts up to `base_kv` positions; longer prompts make room by demoting FFN blocks
+    // (context-elastic placement, see ensure_prefill_vram()).
+    n_ctx_cfg_ = pin.state.n_ctx;
+    const int base_kv = std::min(pin.state.n_ctx, cfg.base_ctx);
+    pin.compute_reserve = cfg.compute_reserve_mb > 0 ? (cfg.compute_reserve_mb << 20) : compute_need(base_kv);
     plan_ = plan_placement(*model_, pin);
+    // enough demotable blocks (RAM copies prepared at load) to fit the prefill scratch of a full-context prompt
+    int n_elastic = 0;
+    {
+        const size_t extra = compute_need(pin.state.n_ctx) > pin.compute_reserve ? compute_need(pin.state.n_ctx) - pin.compute_reserve : 0;
+        size_t got = 0;
+        for (size_t i = plan_.n_spilled_blocks; i < plan_.block_order.size() && got < extra; ++i, ++n_elastic) {
+            for (auto& w : model_->weights) {
+                const Layer& L = model_->layers[plan_.block_order[i]];
+                if (w.t == L.ffn_gate || w.t == L.ffn_up || w.t == L.ffn_down) got += ggml_nbytes(w.t);
+            }
+        }
+        if (n_elastic > 0) n_elastic += 1;  // headroom for estimate error
+    }
     KLOG_INFO("VRAM free %.2f / %.2f GiB; compute reserve %.0f MiB", vram_free / GiB, vram_total / GiB, pin.compute_reserve / MiB);
     KLOG_INFO("plan: %s", plan_.summary().c_str());
 
     // --- load ---
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_);
     ggml_backend_buffer_type_t host_buft = ggml_backend_cuda_host_buffer_type();  // pinned: fast streaming to the GPU
-    model_->load(gpu_buft, host_buft);
+    model_->load(gpu_buft, host_buft, plan_.block_order, plan_.n_spilled_blocks, n_elastic);
+    margin_ = pin.vram_margin;
     // A KV cache in RAM is mapped into the GPU's address space: attention runs on the GPU and reads the cells it
     // needs over PCIe, instead of round-tripping every attention layer through the CPU.
     ggml_backend_buffer_type_t kv_host_buft = cfg.kv_zero_copy ? ggml_backend_cuda_mapped_host_buffer_type(0) : nullptr;
@@ -94,6 +104,42 @@ Engine::~Engine() {
     if (gpu_) ggml_backend_free(gpu_);
 }
 
+size_t Engine::compute_need(int n_kv) const {
+    // Prefill compute buffer: activations of one chunk, streamed copies of spilled weights, and the f16 K/V copy that
+    // flash attention makes of a quantized cache (the dominant term for long prompts).
+    const HParams& hp = model_->hp;
+    const size_t act = (size_t) 4 * cfg_.n_ubatch * hp.n_ff * sizeof(float);
+    const size_t streamed = 160ull << 20;
+    const size_t fa_conv = (size_t) n_kv * hp.kv_row() * 2 * sizeof(uint16_t);
+    return act + streamed + fa_conv;
+}
+
+void Engine::ensure_prefill_vram(int n_kv_end) {
+    const size_t need = compute_need(padded_n_kv(n_kv_end, n_ctx_cfg_));
+    const size_t have_sched = ggml_backend_sched_get_buffer_size(sched_, gpu_);
+    int n = 0;
+    while (vram_free() + have_sched < need + margin_ && model_->next_demote_bytes() > 0 && model_->demote()) ++n;
+    if (n > 0) KLOG_INFO("long prompt (%d positions): moved %d FFN blocks to RAM for the prefill scratch (%d blocks in RAM)", n_kv_end, n,
+                         model_->n_host_blocks());
+}
+
+void Engine::relax_after_prefill() {
+    // Drop the prefill-sized compute buffers, then bring FFN blocks back to VRAM while it has room. Decode needs
+    // little scratch, and every block in VRAM saves CPU time on every token.
+    if (model_->n_host_blocks() == 0) return;
+    const size_t decode_need = 320ull << 20;
+    const size_t sched_buf = ggml_backend_sched_get_buffer_size(sched_, gpu_);
+    if (sched_buf <= decode_need && vram_free() < margin_ + decode_need + model_->next_promote_bytes()) return;
+    ggml_backend_sched_free(sched_);
+    ggml_backend_t backends[2] = {gpu_, cpu_};
+    sched_ = ggml_backend_sched_new(backends, nullptr, 2, 32768, false, true);
+    int n = 0;
+    while (model_->next_promote_bytes() > 0 && vram_free() > margin_ + decode_need + model_->next_promote_bytes() &&
+           model_->n_host_blocks() > plan_.n_spilled_blocks && model_->promote())
+        ++n;
+    if (n > 0) KLOG_DEBUG("moved %d FFN blocks back to VRAM for decoding (%d in RAM)", n, model_->n_host_blocks());
+}
+
 void Engine::reset() {
     state_->clear(gpu_);
     mtp_ready_ = false;
@@ -103,7 +149,9 @@ void Engine::reset() {
 void Engine::run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_dst) {
     const int n_ctx = state_->cfg().n_ctx;
     if (a.pos0 + a.n > n_ctx) fatal("context full (%d tokens)", n_ctx);
-    const int n_kv = padded_n_kv(a.pos0 + a.n, n_ctx);
+    // the MTP layer's cache is a ring buffer of mtp_cells() positions; the main caches are indexed by position
+    const int ring = mtp && mtp_cells(state_->cfg()) < n_ctx ? mtp_cells(state_->cfg()) : 0;
+    const int n_kv = ring ? std::min(ring, padded_n_kv(a.pos0 + a.n, n_ctx)) : padded_n_kv(a.pos0 + a.n, n_ctx);
 
     ggml_init_params ip{meta_buf_.size(), meta_buf_.data(), true};
     ggml_context* ctx = ggml_init(ip);
@@ -124,17 +172,26 @@ void Engine::run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_
     for (int i = 0; i < a.n; ++i) {
         for (int j = 0; j < 3; ++j) pos[(size_t) j * a.n + i] = a.pos0 + i;
         pos[(size_t) 3 * a.n + i] = 0;
-        idx[i] = a.pos0 + i;
+        idx[i] = ring > 0 ? (a.pos0 + i) % ring : a.pos0 + i;
     }
     ggml_backend_tensor_set(g.in.pos, pos.data(), 0, pos.size() * sizeof(int32_t));
     ggml_backend_tensor_set(g.in.kv_idx, idx.data(), 0, idx.size() * sizeof(int64_t));
     {
         std::vector<ggml_fp16_t> mask((size_t) n_kv * a.n);
         const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+        const int end = a.pos0 + a.n - 1;  // last position written by this pass
         for (int i = 0; i < a.n; ++i) {
             const int p = a.pos0 + i;
             ggml_fp16_t* row = mask.data() + (size_t) i * n_kv;
-            for (int j = 0; j < n_kv; ++j) row[j] = (j >= a.kv_lo && j <= p) ? zero : ninf;
+            if (ring == 0) {
+                for (int j = 0; j < n_kv; ++j) row[j] = (j >= a.kv_lo && j <= p) ? zero : ninf;
+            } else {
+                // ring cell j holds the newest position q <= end with q % ring == j (after this pass's writes)
+                for (int j = 0; j < n_kv; ++j) {
+                    const int q = end - ((end - j) % ring + ring) % ring;
+                    row[j] = (q >= a.kv_lo && q <= p && q > p - ring) ? zero : ninf;
+                }
+            }
         }
         ggml_backend_tensor_set(g.in.mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
@@ -191,6 +248,7 @@ void Engine::prefill(const std::vector<int32_t>& tokens, std::vector<float>& las
     const double t0 = now_ms();
     const bool use_mtp = model_->has_mtp() && cfg_.n_draft > 0;
     const int n = (int) tokens.size();
+    if (n > cfg_.n_draft + 1) ensure_prefill_vram(state_->n_past + n);
     for (int i = 0; i < n; i += cfg_.n_ubatch) {
         const int nb = std::min(cfg_.n_ubatch, n - i);
         const bool last = i + nb >= n;
@@ -225,6 +283,7 @@ GenStats Engine::generate(const std::vector<int32_t>& prompt, int n_predict, Sam
         todo = prompt;
     }
     prefill(todo, logits, &st);
+    relax_after_prefill();
 
     const double t0 = now_ms();
     const bool use_mtp = model_->has_mtp() && cfg_.n_draft > 0;

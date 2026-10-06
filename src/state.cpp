@@ -4,6 +4,8 @@
 #include "state.h"
 
 #include "common.h"
+#include <algorithm>
+
 #include "ggml-alloc.h"
 
 namespace klein {
@@ -11,9 +13,17 @@ namespace klein {
 static int64_t conv_row(const HParams& hp) { return (int64_t) (hp.ssm_conv_kernel - 1) * hp.conv_channels(); }
 static int64_t ssm_row(const HParams& hp) { return (int64_t) hp.ssm_d_state * hp.ssm_d_state * hp.ssm_dt_rank; }
 
+int mtp_cells(const StateConfig& cfg) { return std::min(cfg.n_ctx, cfg.mtp_window); }
+
 size_t state_kv_bytes(const HParams& hp, const StateConfig& cfg, bool with_mtp) {
-    const int n_attn = hp.n_attn_layers() + (with_mtp ? 1 : 0);
-    return (size_t) n_attn * (ggml_row_size(cfg.type_k, hp.kv_row()) + ggml_row_size(cfg.type_v, hp.kv_row())) * (size_t) cfg.n_ctx;
+    (void) with_mtp;  // the MTP ring buffer is counted in state_gpu_fixed_bytes()
+    const size_t row = ggml_row_size(cfg.type_k, hp.kv_row()) + ggml_row_size(cfg.type_v, hp.kv_row());
+    return (size_t) hp.n_attn_layers() * row * (size_t) cfg.n_ctx;
+}
+
+size_t state_mtp_kv_bytes(const HParams& hp, const StateConfig& cfg) {
+    const size_t row = ggml_row_size(cfg.type_k, hp.kv_row()) + ggml_row_size(cfg.type_v, hp.kv_row());
+    return row * (size_t) mtp_cells(cfg);
 }
 
 size_t state_recurrent_bytes(const HParams& hp, const StateConfig& cfg) {
@@ -36,7 +46,17 @@ State::State(const Model& model, const StateConfig& cfg, ggml_backend_buffer_typ
     std::vector<ggml_tensor*> kv_tensors, gpu_tensors;
     for (int il = 0; il < n_all; ++il) {
         const bool is_mtp = il >= hp.n_layer;
-        if (is_mtp || !hp.is_recurrent(il)) {
+        if (is_mtp) {
+            // The MTP head attends over a sliding window kept as a ring buffer in VRAM: drafts only need recent
+            // context (the main model verifies every token), and the cost stays flat as the context grows.
+            const int cells = mtp_cells(cfg);
+            k_[il] = ggml_new_tensor_2d(ctx_, cfg.type_k, hp.kv_row(), cells);
+            v_[il] = ggml_new_tensor_2d(ctx_, cfg.type_v, hp.kv_row(), cells);
+            ggml_format_name(k_[il], "cache_k_mtp");
+            ggml_format_name(v_[il], "cache_v_mtp");
+            gpu_tensors.push_back(k_[il]);
+            gpu_tensors.push_back(v_[il]);
+        } else if (!hp.is_recurrent(il)) {
             k_[il] = ggml_new_tensor_2d(ctx_, cfg.type_k, hp.kv_row(), cfg.n_ctx);
             v_[il] = ggml_new_tensor_2d(ctx_, cfg.type_v, hp.kv_row(), cfg.n_ctx);
             ggml_format_name(k_[il], "cache_k_l%d", il);

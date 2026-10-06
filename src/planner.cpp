@@ -64,7 +64,8 @@ Plan plan_placement(Model& model, const PlanInput& in) {
         if (w.place == Place::Gpu) all_weights += ggml_nbytes(w.t);
     }
 
-    const size_t fixed = in.vram_margin + in.compute_reserve + p.rec_bytes + hidden_bytes;
+    const size_t mtp_kv = model.has_mtp() ? state_mtp_kv_bytes(hp, p.state) : 0;
+    const size_t fixed = in.vram_margin + in.compute_reserve + p.rec_bytes + hidden_bytes + mtp_kv;
     if (in.vram_free < fixed) fatal("not enough free VRAM: %.2f GiB free, %.2f GiB needed before any weights", in.vram_free / GiB, fixed / GiB);
     const size_t avail = in.vram_free - fixed;
 
@@ -100,6 +101,7 @@ Plan plan_placement(Model& model, const PlanInput& in) {
     for (auto& [l, u] : units) order.push_back(&u);
     std::sort(order.begin(), order.end(), [](const Unit* a, const Unit* b) { return a->ms / a->bytes < b->ms / b->bytes; });
 
+    for (Unit* u : order) p.block_order.push_back(u->layer);
     size_t gpu = all_weights;
     for (Unit* u : order) {
         if (gpu <= p.budget) break;

@@ -84,6 +84,17 @@ struct WeightInfo {
     int layer = -1;              // -1: global tensor
 };
 
+// One decoder layer's FFN (gate, up, down): the unit that moves between VRAM and RAM.
+struct FfnBlock {
+    int layer = -1;
+    std::vector<WeightInfo*> ws;
+    size_t bytes = 0;
+    ggml_backend_buffer_t gpu = nullptr;   // VRAM copy (when on the GPU)
+    ggml_backend_buffer_t host = nullptr;  // pinned RAM copy (blocks that are, or may become, spilled)
+    ggml_backend_buffer_t alt = nullptr;   // repacked CPU copies (cpu_alt)
+    bool on_gpu = true;
+};
+
 struct ModelOptions {
     std::string path;
     std::string mtp_path;        // optional separate GGUF holding the MTP block (blk.<n_layer>.*)
@@ -116,8 +127,22 @@ public:
     size_t bytes(Place p) const;
     size_t total_bytes() const;
 
-    // Allocates backend buffers according to each WeightInfo::place and reads the data from disk.
-    void load(ggml_backend_buffer_type_t gpu_buft, ggml_backend_buffer_type_t host_buft);
+    // Allocates backend buffers and reads the data from disk. FFN blocks follow `block_order` (cheapest to spill
+    // first): the first `n_spilled` live in RAM, and the next `n_elastic` are in VRAM but also get RAM copies so
+    // they can be demoted cheaply when a long prompt needs VRAM.
+    void load(ggml_backend_buffer_type_t gpu_buft, ggml_backend_buffer_type_t host_buft, const std::vector<int>& block_order,
+              int n_spilled, int n_elastic);
+
+    // FFN blocks in spill order; blocks [0, n_host_blocks()) are in RAM.
+    const std::vector<FfnBlock>& ffn_blocks() const { return blocks_; }
+    int n_host_blocks() const { return n_host_; }
+    // Moves the next block (in spill order) from VRAM to its RAM copy and frees its VRAM. False if none is left
+    // with a RAM copy.
+    bool demote();
+    // Moves the last spilled block back to VRAM. False if there is none or VRAM allocation fails.
+    bool promote();
+    size_t next_demote_bytes() const;
+    size_t next_promote_bytes() const;
 
     const GgufFile& gguf() const { return *main_; }
 
@@ -125,7 +150,11 @@ private:
     std::unique_ptr<GgufFile> main_;
     std::unique_ptr<GgufFile> mtp_;
     bool cpu_repack_ = true;
-    void make_cpu_copies();
+    std::vector<FfnBlock> blocks_;
+    int n_host_ = 0;
+    ggml_backend_buffer_type_t gpu_buft_ = nullptr;
+    void make_cpu_copies(FfnBlock& b);
+    static void bind(FfnBlock& b, ggml_backend_buffer_t buf);
     ggml_context* ctx_ = nullptr;  // tensor objects (no data)
     std::vector<ggml_backend_buffer_t> buffers_;
 
