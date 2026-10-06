@@ -155,9 +155,10 @@ an exact prefix of the new prompt.
 ### 7. CUDA graphs
 
 klein builds ggml with `GGML_CUDA_GRAPHS=ON` (ggml leaves it off outside llama.cpp) and gives every graph kind
-(main/MTP x small/large batch) its own metadata buffer. ggml-cuda caches CUDA graphs by the address of each split's
-first node, so kinds built in the same memory would keep invalidating each other's cached graphs. Without graphs,
-one token cost ~1,700 individual kernel launches at ~10 µs of CPU time each.
+(main/MTP x small/large batch) its own metadata buffer: ggml-cuda caches CUDA graphs by the address of each split's
+first node, so kinds built in the same memory would keep invalidating each other's graphs. Kernel launches per run
+fell from 111,411 to 10,059, but decode only got 3-4% faster: launches overlap GPU work anyway, and the time left is
+waiting at the GPU->CPU hand-offs while the CPU computes the spilled weights (see BENCHMARKS.md).
 
 ## Correctness checks
 

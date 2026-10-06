@@ -85,9 +85,28 @@ Per decode step at the 262K setting (`klein bench -pp 512 -n 256`, printed as `p
 | MTP update | 3.6 |
 
 The verify pass is ~3.4 GiB of spilled FFN weights on the CPU (≈115 ms at ~30 GB/s for a 4-token batch) plus the
-GPU's share and per-pass overhead. An Nsight Systems profile of plain decoding (`--draft 0`) at this commit showed
-~111,000 individual kernel launches (≈10.5 µs CPU each) and ~8,300 stream syncs over the run: CUDA graphs were
-compiled out of klein's ggml build. That is being fixed (`GGML_CUDA_GRAPHS=ON`); results will be added here.
+GPU's share. Nsight Systems profiles of plain decoding (`--draft 0`, 64-token prompt, 64 tokens):
+
+| | CUDA graphs off (`cb466b2`) | CUDA graphs on (`ae44df4`) |
+| --- | ---: | ---: |
+| `cudaLaunchKernel` calls / CPU time | 111,411 / 1,172 ms | 10,059 / 75 ms |
+| `cudaGraphLaunch` calls / CPU time | 0 | 1,300 / 160 ms |
+| `cudaStreamSynchronize` calls / time | 8,320 / 1,928 ms | 8,339 / 2,227 ms |
+
+Launches are asynchronous, so their CPU time mostly overlapped GPU work: CUDA graphs cut it by ~80% but decode
+only by 3-4%. What remains is waiting, ~65 syncs per token, one at each GPU->CPU hand-off around a spilled FFN
+block, i.e. the CPU computing the spilled weights. Decode is bound by reading those weights from RAM.
+
+Same matrix as above with CUDA graphs on (`klein bench`, 262K context):
+
+| Prompt | Prefill | Decode | Verify step | before (graphs off) |
+| ---: | ---: | ---: | ---: | --- |
+| 512 | 960 tok/s | 19.66 tok/s | 155.8 ms | 19.30 tok/s, 160.2 ms |
+| 4,096 | 1,156 tok/s | 20.52 tok/s | 164.7 ms | 21.24 tok/s, 157.6 ms (acceptance 86% vs 88%) |
+| 32,768 | 984 tok/s | 18.98 tok/s | 169.3 ms | 18.78 tok/s, 172.3 ms |
+| 4,096, `--draft 0` | 1,210 tok/s | 7.49 tok/s | 134.3 ms | 7.19 tok/s, 139.9 ms |
+
+`check-spec` with CUDA graphs: 2 near-ties in 300 tokens (worst margin 0.024).
 
 ## CPU throughput per quant type
 
