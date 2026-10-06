@@ -7,6 +7,7 @@
 #include <algorithm>
 
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
 
 namespace klein {
 
@@ -40,7 +41,7 @@ State::State(const Model& model, const StateConfig& cfg, ggml_backend_buffer_typ
     conv_.assign(n_all, nullptr);
     ssm_.assign(n_all, nullptr);
 
-    ggml_init_params ip{ggml_tensor_overhead() * (size_t) (n_all * 4 + 8), nullptr, true};
+    ggml_init_params ip{ggml_tensor_overhead() * (size_t) (n_all * 6 + 8), nullptr, true};
     ctx_ = ggml_init(ip);
 
     std::vector<ggml_tensor*> kv_tensors, gpu_tensors;
@@ -92,7 +93,30 @@ State::State(const Model& model, const StateConfig& cfg, ggml_backend_buffer_typ
         buffers_.push_back(buf);
     };
     alloc(gpu_tensors, gpu_buft, "GPU state (recurrent states / KV cache)");
-    if (cfg.kv_place == Place::Host) alloc(kv_tensors, host_buft, "host KV cache");
+    if (cfg.kv_place == Place::Host) {
+        alloc(kv_tensors, host_buft, "host KV cache");
+        // If that buffer is device-visible (mapped pinned memory), add a plain host view of the same bytes.
+        ggml_backend_buffer_t kvbuf = buffers_.back();
+        if (!ggml_backend_buffer_is_host(kvbuf)) {
+            ggml_backend_buffer_t view = ggml_backend_cpu_buffer_from_ptr(ggml_backend_buffer_get_base(kvbuf), ggml_backend_buffer_get_size(kvbuf));
+            buffers_.push_back(view);
+            k_host_.assign(n_all, nullptr);
+            v_host_.assign(n_all, nullptr);
+            const char* base_dev = (const char*) ggml_backend_buffer_get_base(kvbuf);
+            char* base_host = (char*) ggml_backend_buffer_get_base(view);
+            for (int il = 0; il < n_all; ++il) {
+                if (!k_[il] || il >= hp.n_layer) continue;
+                for (int kv = 0; kv < 2; ++kv) {
+                    ggml_tensor* src = kv ? v_[il] : k_[il];
+                    ggml_tensor* t = ggml_new_tensor_2d(ctx_, src->type, src->ne[0], src->ne[1]);
+                    ggml_format_name(t, "%s_host", ggml_get_name(src));
+                    if (ggml_backend_tensor_alloc(view, t, base_host + ((const char*) src->data - base_dev)) != GGML_STATUS_SUCCESS)
+                        fatal("cannot create the host view of the KV cache");
+                    (kv ? v_host_ : k_host_)[il] = t;
+                }
+            }
+        }
+    }
 
     for (auto t : kv_tensors) kv_bytes_ += ggml_nbytes(t);
     for (int il = 0; il < n_all; ++il) {

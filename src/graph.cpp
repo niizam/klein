@@ -99,8 +99,9 @@ struct Builder {
         kcur = ggml_rope_multi(ctx, kcur, in.pos, nullptr, hp.n_rot, sections, GGML_ROPE_TYPE_IMROPE, hp.n_ctx_train,
                                hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
-        ggml_tensor* ck = st.k(il);
-        ggml_tensor* cv = st.v(il);
+        const bool bulk = n_tokens >= kGpuOffloadBatch;
+        ggml_tensor* ck = bulk ? st.k_bulk(il) : st.k(il);
+        ggml_tensor* cv = bulk ? st.v_bulk(il) : st.v(il);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, ck, ggml_reshape_2d(ctx, kcur, hp.kv_row(), n_tokens), in.kv_idx));
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, cv, ggml_reshape_2d(ctx, vcur, hp.kv_row(), n_tokens), in.kv_idx));
 

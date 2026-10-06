@@ -36,6 +36,11 @@ public:
     // the MTP layer's cache is at index n_layer. Shape [n_head_kv * head_dim, n_ctx].
     ggml_tensor* k(int il) const { return k_[il]; }
     ggml_tensor* v(int il) const { return v_[il]; }
+    // For a KV cache in RAM: the same memory seen as a plain host buffer. Large batches (prefill) use this view: the
+    // scheduler writes it on the CPU and copies the used range to the GPU in bulk before attention, which beats
+    // reading it in small pieces across PCIe. Small batches use k()/v(), mapped into the GPU (zero-copy).
+    ggml_tensor* k_bulk(int il) const { return k_host_.empty() || !k_host_[il] ? k_[il] : k_host_[il]; }
+    ggml_tensor* v_bulk(int il) const { return v_host_.empty() || !v_host_[il] ? v_[il] : v_host_[il]; }
     // Recurrent state per DeltaNet layer: [row, n_snapshots], slot 0 = current, slot s = s tokens back.
     ggml_tensor* conv(int il) const { return conv_[il]; }
     ggml_tensor* ssm(int il) const { return ssm_[il]; }
@@ -61,6 +66,7 @@ private:
     ggml_context* ctx_ = nullptr;
     std::vector<ggml_backend_buffer_t> buffers_;
     std::vector<ggml_tensor*> k_, v_, conv_, ssm_;
+    std::vector<ggml_tensor*> k_host_, v_host_;
     ggml_tensor* hidden_ = nullptr;
     ggml_tensor* mtp_hidden_ = nullptr;
     size_t kv_bytes_ = 0, rec_bytes_ = 0;
