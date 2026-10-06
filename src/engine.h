@@ -32,6 +32,8 @@ struct EngineConfig {
     bool cpu_repack = true;        // repacked CPU copies of spilled weights (faster small-batch decode, more RAM)
     bool kv_zero_copy = true;      // host KV cache read by the GPU over PCIe (else: attention on the CPU)
     int mtp_window = 16384;        // MTP head attention window (positions)
+    bool lookup = false;           // drafts copied from the context when the text repeats it (lossless; measured
+                                   // no gain with 4-token verify batches, see docs/BENCHMARKS.md)
     std::string snap_type = "f16";  // rollback snapshot storage: f16 (half the VRAM, 10-bit mantissa), bf16 or f32
     std::string mmproj_path;       // Qwen3-VL vision encoder GGUF (enables images)
     int image_min_tokens = 8;      // bounds on the tokens one image becomes (each covers 32x32 pixels)
@@ -54,6 +56,7 @@ struct GenStats {
     int n_steps = 0;          // verify passes
     int n_drafted = 0;
     int n_accepted = 0;
+    int n_lookup = 0;         // steps drafted from the context instead of the MTP head
     // time per phase of the decode loop
     double t_draft_ms = 0, t_verify_ms = 0, t_sample_ms = 0, t_rollback_ms = 0, t_mtp_ms = 0;
     double prompt_tps() const { return t_prompt_ms > 0 ? n_prompt * 1000.0 / t_prompt_ms : 0.0; }
@@ -150,6 +153,8 @@ private:
     // MTP pass over cells written at KV cells cell0.., reading main hidden rows [h_row0, h_row0 + n).
     void mtp_pass(const Cell* cells, int n, int cell0, bool from_main, int h_row0, int n_out);
     int32_t mtp_draft_token() const;
+    // Drafts from the longest earlier occurrence of the current suffix; returns the match length (0 = none).
+    int lookup_drafts(int32_t next, int n, std::vector<int32_t>& out) const;
 };
 
 }  // namespace klein

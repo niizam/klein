@@ -70,6 +70,7 @@ void usage() {
         "                      the repacked AVX2 kernels process in one pass\n"
         "  --mtp-window N      MTP attention window in positions (default 16384)\n"
         "  --snap-type T       DeltaNet rollback snapshots: f16 (default), bf16 or f32\n"
+        "  --lookup            also draft from earlier occurrences in the context (off: no measured gain here)\n"
         "\n"
         "run / check-spec:\n"
         "  -p TEXT | -f FILE   prompt; --image FILE (repeatable, needs --mmproj)\n"
@@ -113,6 +114,8 @@ Args parse(int argc, char** argv) {
         else if (s == "--vram-margin") a.ec.vram_margin_mb = std::stoul(next());
         else if (s == "--compute-reserve") a.ec.compute_reserve_mb = std::stoul(next());
         else if (s == "--no-repack") a.ec.cpu_repack = false;
+        else if (s == "--lookup") a.ec.lookup = true;
+        else if (s == "--no-lookup") a.ec.lookup = false;
         else if (s == "--kv-cpu-attn") a.ec.kv_zero_copy = false;
         else if (s == "--mtp-window") a.ec.mtp_window = std::stoi(next());
         else if (s == "--snap-type") a.ec.snap_type = next();
@@ -163,6 +166,7 @@ void print_stats(const GenStats& s) {
     if (s.n_steps > 0)
         std::fprintf(stderr, ", %d steps, %.2f tokens/step, drafts accepted %d/%d (%.0f%%)", s.n_steps, (double) s.n_gen / s.n_steps,
                      s.n_accepted, s.n_drafted, s.n_drafted ? 100.0 * s.n_accepted / s.n_drafted : 0.0);
+    if (s.n_steps > 0) std::fprintf(stderr, ", %d steps drafted from the context", s.n_lookup);
     std::fprintf(stderr, "\n");
     if (s.n_steps > 0)
         std::fprintf(stderr, "per step (ms): draft %.1f, verify %.1f, sample %.1f, rollback %.1f, mtp update %.1f\n",

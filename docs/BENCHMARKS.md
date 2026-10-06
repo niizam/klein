@@ -242,3 +242,19 @@ at the usual speed (15.4 tok/s on the first answer about the photo, 8K context).
 Greedy answers to the same two images and prompts from `klein serve` and `llama-server` (both `--mmproj`,
 `tests/bench/vision_compare.py`) agree word for word for the first ~30 tokens of the description and then differ in
 phrasing ("Below the headline" / "Below the main headline"), as greedy decoding does after a near-tie.
+
+## Lookup drafting (from HyperQwen), measured and left off
+
+Drafting from the earlier occurrence of what was just written (`--lookup`: a match of 8+ tokens is used alone, 3-7
+only when the MTP head's first draft agrees), IQ4_XS, 262K context, greedy:
+
+| Task | Without lookup | With lookup |
+| --- | ---: | ---: |
+| Rewrite a 1,013-token C++ file with two renames (976 tokens out) | 23.88 tok/s, 99% of drafts accepted | 24.10 tok/s, 99%; 239 of 246 steps from the context |
+| `klein bench -pp 512 -n 256` | 19.89 tok/s, 79% | 19.08 tok/s, 77% |
+
+HyperQwen's gain comes from verifying 15-token blocks while the text is copied. klein verifies 4 tokens per step
+(the batch the repacked AVX2 kernels handle in one pass), and within 4 tokens the MTP head already drafts copies
+at 99%, so lookup only saves the ~7 ms of draft passes. Longer verify blocks would need 7 rollback snapshots instead
+of 3 (+~290 MiB of VRAM, about 8% slower decoding everywhere) for ~20% on copies. Lookup stays available as an
+option, off by default.

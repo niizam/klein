@@ -19,6 +19,13 @@ namespace klein {
 // VRAM kept for decode-time compute buffers (verify batches of a few tokens, MTP passes, logits).
 static constexpr size_t kDecodeReserve = 192ull << 20;
 
+// Lookup drafting: a match of at least kLookupStrong tokens is used on its own; a shorter one (>= kLookupMin) only
+// when the MTP head's first draft agrees with it (two independent sources agreeing; HyperQwen's rule).
+static constexpr int kLookupStrong = 8;
+static constexpr int kLookupMin = 3;
+static constexpr int kLookupMaxMatch = 32;
+static constexpr int kLookupScan = 1 << 20;  // positions searched back (the whole context in practice)
+
 static ggml_type parse_kv_type(const std::string& s) {
     if (s == "f16") return GGML_TYPE_F16;
     if (s == "q8_0") return GGML_TYPE_Q8_0;
@@ -313,6 +320,34 @@ void Engine::mtp_pass(const Cell* cells, int n, int cell0, bool from_main, int h
     ggml_free(vctx);
 }
 
+int Engine::lookup_drafts(int32_t next, int n, std::vector<int32_t>& out) const {
+    // Find the earlier occurrence of the longest suffix of (cached tokens + next) and propose the n tokens that
+    // followed it (as in HyperQwen's lookup drafting). The continuation may overlap the suffix itself, so repeating
+    // patterns are proposed from their own period. Image cells have negative ids and never match.
+    out.clear();
+    const int len = (int) cache_.size() + 1;
+    auto at = [&](int i) { return i == len - 1 ? next : cache_[i]; };
+    int best_len = 0, best_pos = -1;
+    const int max_scan = std::min(len - 1, kLookupScan);
+    for (int j = len - 2; j >= len - 1 - max_scan && j >= 0; --j) {
+        if (at(j) != next) continue;
+        int l = 1;
+        while (l < kLookupMaxMatch && j - l >= 0 && at(j - l) == at(len - 1 - l)) ++l;
+        if (l > best_len) {
+            best_len = l;
+            best_pos = j;
+            if (l >= kLookupMaxMatch) break;
+        }
+    }
+    if (best_pos < 0) return 0;
+    for (int k = 1; k <= n && best_pos + k < len; ++k) {
+        const int32_t t = at(best_pos + k);
+        if (t < 0) break;
+        out.push_back(t);
+    }
+    return best_len;
+}
+
 int32_t Engine::mtp_draft_token() const {
     return (int32_t) (std::max_element(mtp_logits_.begin(), mtp_logits_.end()) - mtp_logits_.begin());
 }
@@ -431,14 +466,26 @@ GenStats Engine::generate(const std::vector<int32_t>& prompt, const std::vector<
         batch.assign(1, next);
         double tp = now_ms();
         if (use_mtp) {
-            // draft: d1 from the pending MTP logits, then chain the MTP head on its own hidden states
+            // draft: d1 from the pending MTP logits. When the text is being reproduced from the context (a long
+            // earlier occurrence of what was just written), the rest comes from that occurrence for free; otherwise
+            // the MTP head is chained on its own hidden states.
             int32_t d = mtp_draft_token();
             batch.push_back(d);
-            for (int j = 1; j < cfg_.n_draft; ++j) {
-                const auto c = text_cells(&d, 1, rbase + j);
-                mtp_pass(c.data(), 1, base + j, false, mtp_h_row_, 1);
-                d = mtp_draft_token();
-                batch.push_back(d);
+            std::vector<int32_t> look;
+            const int match = cfg_.lookup ? lookup_drafts(next, cfg_.n_draft, look) : 0;
+            const bool strong = match >= kLookupStrong && (int) look.size() == cfg_.n_draft;
+            const bool agreed = match >= kLookupMin && (int) look.size() == cfg_.n_draft && look[0] == d;
+            if (strong || agreed) {
+                batch.assign(1, next);
+                batch.insert(batch.end(), look.begin(), look.end());
+                st.n_lookup++;
+            } else {
+                for (int j = 1; j < cfg_.n_draft; ++j) {
+                    const auto c = text_cells(&d, 1, rbase + j);
+                    mtp_pass(c.data(), 1, base + j, false, mtp_h_row_, 1);
+                    d = mtp_draft_token();
+                    batch.push_back(d);
+                }
             }
         }
         const int nb = (int) batch.size();
