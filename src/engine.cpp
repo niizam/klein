@@ -4,8 +4,10 @@
 #include "engine.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <thread>
 
 #include "common.h"
@@ -14,10 +16,58 @@
 #include "graph.h"
 #include "vision.h"
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace klein {
 
 // VRAM kept for decode-time compute buffers (verify batches of a few tokens, MTP passes, logits).
 static constexpr size_t kDecodeReserve = 192ull << 20;
+
+// True if `size` bytes of `buft` can be allocated right now (a pinned buffer type that falls back to plain RAM
+// counts as a failure).
+static bool can_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    if (!buft || size == 0) return true;
+    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, size);
+    const bool ok = b && ggml_backend_buffer_get_type(b) == buft;
+    if (b) ggml_backend_buffer_free(b);
+    return ok;
+}
+
+// On Windows, the GPU driver releases a process's pinned RAM a few seconds after the process exits. Started right
+// after a previous klein, pinning can fail, and after one failed pin CUDA cannot pin memory or load kernels in this
+// process at all (it later dies with "shared object initialization failed"). So everything klein will pin is
+// pinned once, up front, while little else is held; if that fails, klein starts over in a fresh process.
+static void ensure_pinnable(ggml_backend_buffer_type_t host_buft, size_t host_bytes,
+                            ggml_backend_buffer_type_t mapped_buft, size_t mapped_bytes) {
+#ifdef _WIN32
+    char env[16] = {0};
+    const int restarts = GetEnvironmentVariableA("KLEIN_PIN_RESTARTS", env, sizeof(env)) ? std::atoi(env) : 0;
+    if (restarts >= 5) return;  // give up probing; the real allocations fall back or report the error
+    if (can_alloc(mapped_buft, mapped_bytes) && can_alloc(host_buft, host_bytes)) return;
+    KLOG_WARN("cannot pin %.2f GiB of RAM yet (the GPU driver is still releasing a previous process's memory); "
+              "restarting in 3 s", (host_bytes + mapped_bytes) / GiB);
+    SetEnvironmentVariableA("KLEIN_PIN_RESTARTS", std::to_string(restarts + 1).c_str());
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = GetCommandLineW();
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+        fatal("cannot pin RAM for the GPU and cannot restart klein (error %lu)", GetLastError());
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    std::fflush(nullptr);
+    ExitProcess(code);
+#else
+    (void) host_buft; (void) host_bytes; (void) mapped_buft; (void) mapped_bytes;
+#endif
+}
 
 // Lookup drafting: a match of at least kLookupStrong tokens is used on its own; a shorter one (>= kLookupMin) only
 // when the MTP head's first draft agrees with it (two independent sources agreeing; HyperQwen's rule).
@@ -91,13 +141,25 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     // --- load ---
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_);
     ggml_backend_buffer_type_t host_buft = ggml_backend_cuda_host_buffer_type();  // pinned: fast streaming to the GPU
-    model_->load(gpu_buft, host_buft, plan_.block_order, plan_.n_spilled_blocks, n_elastic);
-    margin_ = pin.vram_margin;
     // A KV cache in RAM is mapped into the GPU's address space: attention runs on the GPU and reads the cells it
     // needs over PCIe, instead of round-tripping every attention layer through the CPU.
     ggml_backend_buffer_type_t kv_host_buft = cfg.kv_zero_copy ? ggml_backend_cuda_mapped_host_buffer_type(0) : nullptr;
     kv_mapped_ = kv_host_buft != nullptr;
     if (!kv_host_buft) kv_host_buft = host_buft;
+    {
+        // pinned at load: weights in RAM, RAM copies of the demotable blocks, the KV cache in RAM, the vision encoder
+        size_t host_bytes = plan_.weights_host;
+        for (int i = plan_.n_spilled_blocks; i < plan_.n_spilled_blocks + n_elastic && i < (int) plan_.block_order.size(); ++i) {
+            const Layer& L = model_->layers[plan_.block_order[i]];
+            for (const ggml_tensor* t : {L.ffn_gate, L.ffn_up, L.ffn_down}) host_bytes += t ? ggml_nbytes(t) : 0;
+        }
+        if (!cfg.mmproj_path.empty()) host_bytes += (size_t) std::filesystem::file_size(cfg.mmproj_path);
+        const size_t kv_bytes = plan_.state.kv_place == Place::Host ? plan_.kv_bytes : 0;
+        if (kv_mapped_) ensure_pinnable(host_buft, host_bytes, kv_host_buft, kv_bytes);
+        else ensure_pinnable(host_buft, host_bytes + kv_bytes, nullptr, 0);
+    }
+    model_->load(gpu_buft, host_buft, plan_.block_order, plan_.n_spilled_blocks, n_elastic);
+    margin_ = pin.vram_margin;
     state_ = std::make_unique<State>(*model_, plan_.state, gpu_buft, kv_host_buft);
     if (!cfg.mmproj_path.empty()) {
         vision_ = std::make_unique<VisionModel>(cfg.mmproj_path, host_buft);
