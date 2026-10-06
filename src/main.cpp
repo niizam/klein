@@ -16,6 +16,7 @@
 
 #include "common.h"
 #include "engine.h"
+#include "image.h"
 #include "server.h"
 
 using namespace klein;
@@ -35,6 +36,7 @@ struct Args {
     ServerOptions so;
     bool raw = false;
     bool think = false;
+    std::vector<std::string> images;
     SamplerParams sp;
 };
 
@@ -51,6 +53,8 @@ void usage() {
         "\n"
         "model and memory:\n"
         "  --mtp FILE          GGUF with a (smaller) MTP block to use for drafting instead of the model's own\n"
+        "  --mmproj FILE       Qwen3-VL vision encoder GGUF (enables images; weights stay in RAM)\n"
+        "  --image-max-tokens N  most tokens one image becomes (default 1024; each covers 32x32 pixels)\n"
         "  -c, --ctx N         context length (default: the model's, 262144)\n"
         "  --kv TYPE           KV cache type: auto|f16|q8_0|q4_0 (auto: q4_0 above 128K, else q8_0)\n"
         "  --kv-place P        auto|gpu|host (auto: RAM unless the cache is small or everything fits)\n"
@@ -68,7 +72,7 @@ void usage() {
         "  --snap-type T       DeltaNet rollback snapshots: f16 (default), bf16 or f32\n"
         "\n"
         "run / check-spec:\n"
-        "  -p TEXT | -f FILE   prompt\n"
+        "  -p TEXT | -f FILE   prompt; --image FILE (repeatable, needs --mmproj)\n"
         "  -n N                tokens to generate (default 256)\n"
         "  --raw               no chat template; --think: leave thinking on (default: off for run)\n"
         "  --temp T --top-k K --top-p P --min-p P --presence-penalty P --seed S   sampling (default greedy)\n"
@@ -96,6 +100,10 @@ Args parse(int argc, char** argv) {
         };
         if (s == "-m") a.ec.model_path = next();
         else if (s == "--mtp") a.ec.mtp_path = next();
+        else if (s == "--mmproj") a.ec.mmproj_path = next();
+        else if (s == "--image") a.images.push_back(next());
+        else if (s == "--image-max-tokens") a.ec.image_max_tokens = std::stoi(next());
+        else if (s == "--image-min-tokens") a.ec.image_min_tokens = std::stoi(next());
         else if (s == "-c" || s == "--ctx") a.ec.n_ctx = std::stoi(next());
         else if (s == "--kv") a.ec.kv_type = next();
         else if (s == "--kv-place") a.ec.kv_place = next();
@@ -162,14 +170,44 @@ void print_stats(const GenStats& s) {
                      s.t_mtp_ms / s.n_steps);
 }
 
+// Reads, decodes and encodes the --image files (the prompt gets one placeholder per image, before the text).
+std::vector<PromptImage> load_images(Engine& eng, const Args& a, std::string& user_text) {
+    std::vector<PromptImage> out;
+    std::string prefix;
+    for (const std::string& path : a.images) {
+        const std::string bytes = read_file(path);
+        out.push_back(eng.encode_image(decode_image((const uint8_t*) bytes.data(), bytes.size())));
+        prefix += "<|vision_start|><|image_pad|><|vision_end|>";
+    }
+    user_text = prefix + user_text;
+    return out;
+}
+
+// Encodes a synthetic image given as raw floats (as llama.cpp's llama-mtmd-debug -p encode does) and prints the sum of
+// each checkpoint tensor, for a numerical comparison of the vision encoder.
+int cmd_vision_debug(Args& a) {
+    a.ec.n_draft = 0;
+    a.ec.n_ctx = 4096;
+    Engine eng(a.ec);
+    const int n = a.pp;  // -pp N: image side in pixels
+    ImageInput in;
+    in.w = in.h = n;
+    in.planar.assign((size_t) 3 * n * n, 0.0f);
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x)
+            for (int c = 0; c < 3; ++c) in.planar[(size_t) c * n * n + (size_t) y * n + x] = ((x + y) % 2) ? 0.0f : 1.0f;
+    for (const auto& [name, s] : eng.vision_debug(in)) std::printf("%-14s sum = %.6f\n", name.c_str(), s);
+    return 0;
+}
+
 int cmd_run(Args& a) {
     Engine eng(a.ec);
     std::string text = a.file.empty() ? a.prompt : read_file(a.file);
+    const auto images = load_images(eng, a, text);
     if (!a.raw) text = chat_prompt(text, a.think);
     const auto toks = eng.tokenizer().encode(text, true);
     Sampler smp(a.sp);
-    std::string pending;
-    auto st = eng.generate(toks, a.n_predict, smp, [&](int32_t t) {
+    auto st = eng.generate(toks, images, a.n_predict, smp, [&](int32_t t) {
         std::fputs(eng.tokenizer().token_to_piece(t, false).c_str(), stdout);
         std::fflush(stdout);
         return true;
@@ -349,6 +387,7 @@ int main(int argc, char** argv) {
     if (a.cmd == "bench") return cmd_bench(a);
     if (a.cmd == "ppl") return cmd_ppl(a);
     if (a.cmd == "check-spec") return cmd_check_spec(a);
+    if (a.cmd == "vision-debug") return cmd_vision_debug(a);
     if (a.cmd == "serve") {
         Engine eng(a.ec);
         return run_server(eng, a.so);

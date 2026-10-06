@@ -12,6 +12,7 @@
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 #include "graph.h"
+#include "vision.h"
 
 namespace klein {
 
@@ -91,6 +92,12 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     kv_mapped_ = kv_host_buft != nullptr;
     if (!kv_host_buft) kv_host_buft = host_buft;
     state_ = std::make_unique<State>(*model_, plan_.state, gpu_buft, kv_host_buft);
+    if (!cfg.mmproj_path.empty()) {
+        vision_ = std::make_unique<VisionModel>(cfg.mmproj_path, host_buft);
+        if (vision_->hp.proj_dim != hp.n_embd) fatal("the vision encoder projects to %d dimensions, the model has %d", vision_->hp.proj_dim, hp.n_embd);
+        image_pad_id_ = tok_.find("<|image_pad|>");
+        if (image_pad_id_ < 0) fatal("the model's vocabulary has no <|image_pad|> token");
+    }
 
     // --- scheduler ---
     ggml_backend_t backends[2] = {gpu_, cpu_};
@@ -102,6 +109,7 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
 }
 
 Engine::~Engine() {
+    vision_.reset();
     state_.reset();
     model_.reset();
     if (sched_) ggml_backend_sched_free(sched_);
@@ -154,6 +162,12 @@ void Engine::warmup() {
     Sampler smp(SamplerParams{});
     generate(toks, 3, smp, [](int32_t) { return true; });
     reset();
+    if (vision_) {
+        ImageRGB grey;
+        grey.w = grey.h = 64;
+        grey.px.assign((size_t) 64 * 64 * 3, 128);
+        encode_image(grey);
+    }
     KLOG_DEBUG("warm-up %.0f ms", now_ms() - t0);
 }
 
@@ -161,14 +175,19 @@ void Engine::reset() {
     state_->clear(gpu_);
     mtp_ready_ = false;
     cache_.clear();
+    cache_rope_after_.clear();
 }
+
+int Engine::rope_next() const { return cache_rope_after_.empty() ? 0 : cache_rope_after_.back(); }
 
 void Engine::run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_dst) {
     const int n_ctx = state_->cfg().n_ctx;
-    if (a.pos0 + a.n > n_ctx) fatal("context full (%d tokens)", n_ctx);
-    // the MTP layer's cache is a ring buffer of mtp_cells() positions; the main caches are indexed by position
+    if (a.cell0 + a.n > n_ctx) fatal("context full (%d tokens)", n_ctx);
+    // the MTP layer's cache is a ring buffer of mtp_cells() positions; the main caches are indexed by cell
     const int ring = mtp && mtp_cells(state_->cfg()) < n_ctx ? mtp_cells(state_->cfg()) : 0;
-    const int n_kv = ring ? std::min(ring, padded_n_kv(a.pos0 + a.n, n_ctx)) : padded_n_kv(a.pos0 + a.n, n_ctx);
+    const int n_kv = ring ? std::min(ring, padded_n_kv(a.cell0 + a.n, n_ctx)) : padded_n_kv(a.cell0 + a.n, n_ctx);
+    bool embd_in = false;
+    for (int i = 0; i < a.n && !embd_in; ++i) embd_in = a.cells[i].emb != nullptr;
 
     // One metadata buffer per graph kind: ggml-cuda caches CUDA graphs by the address of each split's first node, so
     // kinds built in the same memory would keep invalidating each other's cached graphs.
@@ -176,38 +195,58 @@ void Engine::run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_
     if (meta.empty()) meta.resize(ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false));
     ggml_init_params ip{meta.size(), meta.data(), true};
     ggml_context* ctx = ggml_init(ip);
-    FwdGraph g = mtp ? build_mtp_graph(ctx, *model_, *state_, a.n, n_kv, a.n_out, h_src, h_dst)
-                     : build_main_graph(ctx, *model_, *state_, a.n, n_kv, a.n_out);
+    FwdGraph g = mtp ? build_mtp_graph(ctx, *model_, *state_, a.n, n_kv, a.n_out, h_src, h_dst, embd_in)
+                     : build_main_graph(ctx, *model_, *state_, a.n, n_kv, a.n_out, embd_in);
 
     ggml_backend_sched_reset(sched_);
-    // With the KV cache in RAM, small batches attend on the CPU (copying the cache to the GPU would cost more).
+    // With the KV cache in plain RAM, small batches attend on the CPU (copying the cache to the GPU would cost more).
     if (state_->cfg().kv_place == Place::Host && !state_->kv_mapped() && a.n < 32) {
         for (ggml_tensor* t : g.attn_nodes) ggml_backend_sched_set_tensor_backend(sched_, t, cpu_);
     }
     if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) fatal("failed to allocate the compute graph");
 
-    // inputs
-    ggml_backend_tensor_set(g.in.tokens, a.tokens, 0, (size_t) a.n * sizeof(int32_t));
+    // inputs: tokens, or embedding rows (image cells as given, text cells looked up in token_embd on the host)
+    if (embd_in) {
+        const HParams& hp = model_->hp;
+        std::vector<float> e((size_t) a.n * hp.n_embd);
+        const ggml_tensor* te = model_->tok_embd;
+        const auto* traits = ggml_get_type_traits(te->type);
+        for (int i = 0; i < a.n; ++i) {
+            float* dst = e.data() + (size_t) i * hp.n_embd;
+            if (a.cells[i].emb) {
+                std::memcpy(dst, a.cells[i].emb, (size_t) hp.n_embd * sizeof(float));
+            } else {
+                const char* row = (const char*) te->data + (size_t) a.cells[i].id * te->nb[1];
+                traits->to_float(row, dst, hp.n_embd);
+            }
+        }
+        ggml_backend_tensor_set(g.in.embd, e.data(), 0, e.size() * sizeof(float));
+    } else {
+        std::vector<int32_t> toks(a.n);
+        for (int i = 0; i < a.n; ++i) toks[i] = a.cells[i].id;
+        ggml_backend_tensor_set(g.in.tokens, toks.data(), 0, toks.size() * sizeof(int32_t));
+    }
+    // M-RoPE positions, section-major: [t..., y..., x..., 0...]; text cells have t = y = x
     std::vector<int32_t> pos((size_t) a.n * 4);
     std::vector<int64_t> idx(a.n);
     for (int i = 0; i < a.n; ++i) {
-        for (int j = 0; j < 3; ++j) pos[(size_t) j * a.n + i] = a.pos0 + i;
+        for (int j = 0; j < 3; ++j) pos[(size_t) j * a.n + i] = a.cells[i].rope[j];
         pos[(size_t) 3 * a.n + i] = 0;
-        idx[i] = ring > 0 ? (a.pos0 + i) % ring : a.pos0 + i;
+        idx[i] = ring > 0 ? (a.cell0 + i) % ring : a.cell0 + i;
     }
     ggml_backend_tensor_set(g.in.pos, pos.data(), 0, pos.size() * sizeof(int32_t));
     ggml_backend_tensor_set(g.in.kv_idx, idx.data(), 0, idx.size() * sizeof(int64_t));
     {
         std::vector<ggml_fp16_t> mask((size_t) n_kv * a.n);
         const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-        const int end = a.pos0 + a.n - 1;  // last position written by this pass
+        const int end = a.cell0 + a.n - 1;  // last cell written by this pass
         for (int i = 0; i < a.n; ++i) {
-            const int p = a.pos0 + i;
+            const int p = a.cell0 + i;
             ggml_fp16_t* row = mask.data() + (size_t) i * n_kv;
             if (ring == 0) {
                 for (int j = 0; j < n_kv; ++j) row[j] = (j >= a.kv_lo && j <= p) ? zero : ninf;
             } else {
-                // ring cell j holds the newest position q <= end with q % ring == j (after this pass's writes)
+                // ring slot j holds the newest cell q <= end with q % ring == j (after this pass's writes)
                 for (int j = 0; j < n_kv; ++j) {
                     const int q = end - ((end - j) % ring + ring) % ring;
                     row[j] = (q >= a.kv_lo && q <= p && q > p - ring) ? zero : ninf;
@@ -230,14 +269,28 @@ void Engine::run(bool mtp, const RunArgs& a, ggml_tensor* h_src, ggml_tensor* h_
     ggml_free(ctx);
 }
 
-void Engine::eval(const int32_t* tokens, int n, int n_out, std::vector<float>* logits) {
+void Engine::eval_cells(const Cell* cells, int n, int n_out, std::vector<float>* logits) {
     KLEIN_ASSERT(n <= state_->cfg().max_batch);
-    run(false, RunArgs{tokens, n, state_->n_past, 0, n_out, logits}, nullptr, nullptr);
+    run(false, RunArgs{cells, n, state_->n_past, 0, n_out, logits}, nullptr, nullptr);
     state_->n_past += n;
-    cache_.insert(cache_.end(), tokens, tokens + n);
+    for (int i = 0; i < n; ++i) {
+        cache_.push_back(cells[i].id);
+        cache_rope_after_.push_back(cells[i].rope_after);
+    }
 }
 
-void Engine::mtp_pass(const int32_t* tokens, int n, int pos0, bool from_main, int h_row0, int n_out) {
+std::vector<Engine::Cell> Engine::text_cells(const int32_t* tokens, int n, int rope0) {
+    std::vector<Cell> c(n);
+    for (int i = 0; i < n; ++i) c[i] = Cell{tokens[i], nullptr, {rope0 + i, rope0 + i, rope0 + i}, rope0 + i + 1};
+    return c;
+}
+
+void Engine::eval(const int32_t* tokens, int n, int n_out, std::vector<float>* logits) {
+    const auto c = text_cells(tokens, n, rope_next());
+    eval_cells(c.data(), n, n_out, logits);
+}
+
+void Engine::mtp_pass(const Cell* cells, int n, int cell0, bool from_main, int h_row0, int n_out) {
     ggml_tensor* hsrc_base = from_main ? state_->hidden() : state_->mtp_hidden();
     // The MTP pass's own hidden states go to mtp_hidden rows right after the rows it reads (no overlap).
     const int dst_row0 = from_main ? 0 : h_row0 + 1;
@@ -250,10 +303,9 @@ void Engine::mtp_pass(const int32_t* tokens, int n, int pos0, bool from_main, in
                                       (size_t) dst_row0 * hsrc_base->nb[1]);
     ggml_backend_view_init(h_src);
     ggml_backend_view_init(h_dst);
-    std::vector<float>* out = n_out > 0 ? &mtp_logits_ : nullptr;
     std::vector<float> tmp;
-    run(true, RunArgs{tokens, n, pos0, 1, n_out, n_out > 0 ? &tmp : nullptr}, h_src, h_dst);
-    if (out) {
+    run(true, RunArgs{cells, n, cell0, 1, n_out, n_out > 0 ? &tmp : nullptr}, h_src, h_dst);
+    if (n_out > 0) {
         std::copy(tmp.end() - n_vocab(), tmp.end(), mtp_logits_.begin());
         mtp_ready_ = true;
     }
@@ -265,21 +317,21 @@ int32_t Engine::mtp_draft_token() const {
     return (int32_t) (std::max_element(mtp_logits_.begin(), mtp_logits_.end()) - mtp_logits_.begin());
 }
 
-void Engine::prefill(const std::vector<int32_t>& tokens, std::vector<float>& last_logits, GenStats* stats) {
+void Engine::prefill_cells(const std::vector<Cell>& cells, std::vector<float>& last_logits, GenStats* stats) {
     const double t0 = now_ms();
     const bool use_mtp = model_->has_mtp() && cfg_.n_draft > 0;
-    const int n = (int) tokens.size();
+    const int n = (int) cells.size();
     if (n > cfg_.n_draft + 1) ensure_prefill_vram(state_->n_past + n, n);
     for (int i = 0; i < n; i += cfg_.n_ubatch) {
         const int nb = std::min(cfg_.n_ubatch, n - i);
         const bool last = i + nb >= n;
-        const int pos0 = state_->n_past;
-        eval(tokens.data() + i, nb, last ? 1 : 0, last ? &last_logits : nullptr);
-        // MTP: position p takes token p and the main hidden state of position p - 1. The chunk's last position
-        // needs the next token, which for the final chunk is only known after sampling (see generate()).
+        const int cell0 = state_->n_past;
+        eval_cells(cells.data() + i, nb, last ? 1 : 0, last ? &last_logits : nullptr);
+        // MTP: cell c takes cell c's input and the main hidden state of cell c - 1. The chunk's last cell needs the
+        // next input, which for the final chunk is only known after sampling (see generate()).
         if (use_mtp) {
             const int m = last ? nb - 1 : nb;
-            if (m > 0) mtp_pass(tokens.data() + i + 1, m, pos0 + 1, true, 0, 0);
+            if (m > 0) mtp_pass(cells.data() + i + 1, m, cell0 + 1, true, 0, 0);
         }
     }
     if (stats) {
@@ -288,22 +340,72 @@ void Engine::prefill(const std::vector<int32_t>& tokens, std::vector<float>& las
     }
 }
 
+void Engine::prefill(const std::vector<int32_t>& tokens, std::vector<float>& last_logits, GenStats* stats) {
+    prefill_cells(text_cells(tokens.data(), (int) tokens.size(), rope_next()), last_logits, stats);
+}
+
+std::vector<Engine::Cell> Engine::build_cells(const std::vector<int32_t>& prompt, const std::vector<PromptImage>& images) const {
+    // Each image placeholder token (<|image_pad|>) becomes the image's grid of embeddings. Image cells share the
+    // M-RoPE time position; their height/width positions follow the grid; the text after an image continues at
+    // max(grid_w, grid_h) past the image's start (Qwen-VL convention, as in llama.cpp's mtmd).
+    std::vector<Cell> cells;
+    cells.reserve(prompt.size());
+    int r = 0;
+    size_t img = 0;
+    for (int32_t t : prompt) {
+        if (t == image_pad_id_ && img < images.size()) {
+            const PromptImage& im = images[img++];
+            const int after = r + std::max(im.grid_x, im.grid_y);
+            for (int k = 0; k < im.grid_x * im.grid_y; ++k) {
+                // pseudo token id: negative, derived from the image content and the cell, so prompt reuse compares
+                // images by content
+                const uint64_t h = (im.hash ^ (0x9E3779B97F4A7C15ull * (uint64_t) (k + 1))) * 0xBF58476D1CE4E5B9ull;
+                const int32_t id = -1 - (int32_t) (h >> 34);
+                cells.push_back(Cell{id, im.embd.data() + (size_t) k * model_->hp.n_embd,
+                                     {r, r + k / im.grid_x, r + k % im.grid_x}, after});
+            }
+            r = after;
+        } else {
+            cells.push_back(Cell{t, nullptr, {r, r, r}, r + 1});
+            ++r;
+        }
+    }
+    if (img < images.size()) fatal("%zu image(s) given but only %zu image placeholder(s) in the prompt", images.size(), img);
+    return cells;
+}
+
 GenStats Engine::generate(const std::vector<int32_t>& prompt, int n_predict, Sampler& sampler,
+                          const std::function<bool(int32_t)>& on_token) {
+    return generate(prompt, {}, n_predict, sampler, on_token);
+}
+
+GenStats Engine::generate(const std::vector<int32_t>& prompt, const std::vector<PromptImage>& images, int n_predict, Sampler& sampler,
                           const std::function<bool(int32_t)>& on_token) {
     GenStats st;
     const int n_vocab_ = n_vocab();
     std::vector<float> logits;
+    const std::vector<Cell> all = build_cells(prompt, images);
+    st.n_prompt_total = (int) all.size();
+    if ((int) all.size() + cfg_.n_draft + 2 > n_ctx())
+        throw std::runtime_error(format("the prompt (%zu tokens) does not fit the context (%d)", all.size(), n_ctx()));
     size_t common = 0;
-    while (common < cache_.size() && common < prompt.size() && cache_[common] == prompt[common]) ++common;
-    std::vector<int32_t> todo;
-    if (common > 0 && common == cache_.size() && common < prompt.size()) {
-        todo.assign(prompt.begin() + common, prompt.end());
+    while (common < cache_.size() && common < all.size() && cache_[common] == all[common].id) ++common;
+    std::vector<Cell> todo;
+    if (common > 0 && common == cache_.size() && common < all.size()) {
+        todo.assign(all.begin() + common, all.end());
+        // the cached part may have shifted rope positions (images): continue from where the cache ends
+        const int shift = rope_next() - all[common].rope[0];
+        if (shift != 0)
+            for (Cell& c : todo) {
+                for (int& p : c.rope) p += shift;
+                c.rope_after += shift;
+            }
         KLOG_DEBUG("reusing %zu cached tokens, prefilling %zu", common, todo.size());
     } else {
         reset();
-        todo = prompt;
+        todo = all;
     }
-    prefill(todo, logits, &st);
+    prefill_cells(todo, logits, &st);
     relax_after_prefill();
 
     const double t0 = now_ms();
@@ -315,13 +417,17 @@ GenStats Engine::generate(const std::vector<int32_t>& prompt, int n_predict, Sam
         st.t_gen_ms = now_ms() - t0;
         return st;
     }
-    // finish the MTP pass for the prompt's last position, now that its next token is known
-    if (use_mtp) mtp_pass(&next, 1, state_->n_past, true, (int) ((todo.size() - 1) % cfg_.n_ubatch), 1);
+    // finish the MTP pass for the prompt's last cell, now that its next token is known
+    if (use_mtp) {
+        const auto c = text_cells(&next, 1, rope_next());
+        mtp_pass(c.data(), 1, state_->n_past, true, (int) ((todo.size() - 1) % cfg_.n_ubatch), 1);
+    }
 
     std::vector<int32_t> batch;
     bool stop = false;
     while (!stop && st.n_gen < n_predict && state_->n_past + cfg_.n_draft + 2 < n_ctx()) {
-        const int base = state_->n_past;  // position of `next`
+        const int base = state_->n_past;  // cell of `next`
+        const int rbase = rope_next();    // its rope position
         batch.assign(1, next);
         double tp = now_ms();
         if (use_mtp) {
@@ -329,7 +435,8 @@ GenStats Engine::generate(const std::vector<int32_t>& prompt, int n_predict, Sam
             int32_t d = mtp_draft_token();
             batch.push_back(d);
             for (int j = 1; j < cfg_.n_draft; ++j) {
-                mtp_pass(&d, 1, base + j, false, mtp_h_row_, 1);
+                const auto c = text_cells(&d, 1, rbase + j);
+                mtp_pass(c.data(), 1, base + j, false, mtp_h_row_, 1);
                 d = mtp_draft_token();
                 batch.push_back(d);
             }
@@ -337,7 +444,8 @@ GenStats Engine::generate(const std::vector<int32_t>& prompt, int n_predict, Sam
         const int nb = (int) batch.size();
         st.t_draft_ms += now_ms() - tp;
         tp = now_ms();
-        eval(batch.data(), nb, nb, &logits);
+        const auto vc = text_cells(batch.data(), nb, rbase);
+        eval_cells(vc.data(), nb, nb, &logits);
         st.t_verify_ms += now_ms() - tp;
         tp = now_ms();
         st.n_steps++;
@@ -362,15 +470,17 @@ GenStats Engine::generate(const std::vector<int32_t>& prompt, int n_predict, Sam
         const int rejected = (nb - 1) - accepted;
         state_->n_past = base + accepted + 1;
         cache_.resize(state_->n_past);
+        cache_rope_after_.resize(state_->n_past);
         if (rejected > 0) state_->rollback_recurrent(gpu_, rejected);
         st.t_rollback_ms += now_ms() - tp;
         tp = now_ms();
         if (stop) break;
         if (use_mtp) {
-            // true MTP pass over the kept positions base+1 .. base+accepted+1 (main hidden rows 0..accepted)
+            // true MTP pass over the kept cells base+1 .. base+accepted+1 (main hidden rows 0..accepted)
             std::vector<int32_t> mt(batch.begin() + 1, batch.begin() + 1 + accepted);
             mt.push_back(next);
-            mtp_pass(mt.data(), (int) mt.size(), base + 1, true, 0, 1);
+            const auto mc = text_cells(mt.data(), (int) mt.size(), rbase + 1);
+            mtp_pass(mc.data(), (int) mc.size(), base + 1, true, 0, 1);
         }
         st.t_mtp_ms += now_ms() - tp;
     }
@@ -379,6 +489,88 @@ GenStats Engine::generate(const std::vector<int32_t>& prompt, int n_predict, Sam
                ggml_backend_sched_get_buffer_size(sched_, gpu_) / MiB, ggml_backend_sched_get_buffer_size(sched_, cpu_) / MiB,
                vram_free() / MiB, model_->n_host_blocks());
     return st;
+}
+
+std::vector<std::pair<std::string, double>> Engine::vision_debug(const ImageInput& in) {
+    if (!vision_) throw std::runtime_error("no vision encoder (--mmproj)");
+    std::vector<std::pair<std::string, double>> sums;
+    std::vector<uint8_t>& meta = vision_meta_;
+    if (meta.empty()) meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(8192, false));
+    ggml_init_params ip{meta.size(), meta.data(), true};
+    ggml_context* ctx = ggml_init(ip);
+    VisionModel::Graph g = vision_->build(ctx, in.w, in.h);
+    ggml_backend_sched_reset(sched_);
+    struct Cb {
+        std::vector<std::pair<std::string, double>>* sums;
+    } cb{&sums};
+    ggml_backend_sched_set_eval_callback(
+        sched_,
+        [](ggml_tensor* t, bool ask, void* ud) -> bool {
+            const std::string n = ggml_get_name(t);
+            const bool want = n == "patch_bias" || n == "inp_pos_emb" || n.rfind("layer_out-", 0) == 0 || n == "post_ln" || n == "v_embd";
+            if (ask) return want;
+            if (want && t->type == GGML_TYPE_F32) {
+                std::vector<float> v(ggml_nelements(t));
+                ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+                double s = 0;
+                for (float x : v) s += x;
+                ((Cb*) ud)->sums->push_back({n, s});
+            }
+            return true;
+        },
+        &cb);
+    if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) fatal("failed to allocate the vision graph");
+    ggml_backend_tensor_set(g.inp_raw, in.planar.data(), 0, in.planar.size() * sizeof(float));
+    const auto pos = vision_->positions(in.w, in.h);
+    ggml_backend_tensor_set(g.positions, pos.data(), 0, pos.size() * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(sched_, g.gf) != GGML_STATUS_SUCCESS) fatal("vision graph compute failed");
+    ggml_backend_sched_set_eval_callback(sched_, nullptr, nullptr);
+    ggml_free(ctx);
+    return sums;
+}
+
+PromptImage Engine::encode_image(const ImageRGB& img) {
+    if (!vision_) throw std::runtime_error("this server has no vision encoder (start it with --mmproj FILE)");
+    const double t0 = now_ms();
+    const VisionModel::HParams& vh = vision_->hp;
+    ImageInput in = preprocess_qwen_vl(img, vision_->align(), cfg_.image_min_tokens, cfg_.image_max_tokens, vh.mean, vh.std);
+    const int n_patches = (in.w / vh.patch) * (in.h / vh.patch);
+
+    // VRAM for the encoder's activations (its weights are streamed from RAM): borrow it from FFN blocks
+    const size_t need = (size_t) n_patches * 64 * 1024 + (192ull << 20);
+    const size_t have_sched = ggml_backend_sched_get_buffer_size(sched_, gpu_);
+    int demoted = 0;
+    while (vram_free() + have_sched < need + margin_ && model_->next_demote_bytes() > 0 && model_->demote()) ++demoted;
+
+    std::vector<uint8_t>& meta = vision_meta_;
+    if (meta.empty()) meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(8192, false));
+    ggml_init_params ip{meta.size(), meta.data(), true};
+    ggml_context* ctx = ggml_init(ip);
+    VisionModel::Graph g = vision_->build(ctx, in.w, in.h);
+    ggml_backend_sched_reset(sched_);
+    if (!ggml_backend_sched_alloc_graph(sched_, g.gf)) fatal("failed to allocate the vision graph");
+    ggml_backend_tensor_set(g.inp_raw, in.planar.data(), 0, in.planar.size() * sizeof(float));
+    const auto pos = vision_->positions(in.w, in.h);
+    ggml_backend_tensor_set(g.positions, pos.data(), 0, pos.size() * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(sched_, g.gf) != GGML_STATUS_SUCCESS) fatal("vision graph compute failed");
+
+    PromptImage out;
+    out.grid_x = g.grid_x;
+    out.grid_y = g.grid_y;
+    out.embd.resize((size_t) g.n_tokens * vh.proj_dim);
+    ggml_backend_tensor_get(g.out, out.embd.data(), 0, out.embd.size() * sizeof(float));
+    ggml_free(ctx);
+    // content hash (FNV-1a over the pixels and size) for prompt reuse
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    mix((uint64_t) img.w);
+    mix((uint64_t) img.h);
+    for (uint8_t b : img.px) mix(b);
+    out.hash = h;
+    relax_after_prefill();
+    KLOG_INFO("image %dx%d -> %dx%d pixels -> %d tokens (%dx%d) in %.0f ms%s", img.w, img.h, in.w, in.h, g.n_tokens, g.grid_x, g.grid_y,
+              now_ms() - t0, demoted ? format(", %d FFN blocks lent to the encoder", demoted).c_str() : "");
+    return out;
 }
 
 }  // namespace klein

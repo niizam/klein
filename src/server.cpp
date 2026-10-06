@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "chat.h"
+#include "image.h"
 #include "index_html.h"
 #include "common.h"
 #include "engine.h"
@@ -349,11 +350,81 @@ struct GenResult {
     bool write_failed = false;
 };
 
+// Base64 (standard alphabet, padding optional, whitespace ignored).
+std::string base64_decode(const std::string& in) {
+    static int8_t map[256];
+    static bool init = false;
+    if (!init) {
+        std::fill(std::begin(map), std::end(map), (int8_t) -1);
+        const char* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int k = 0; k < 64; ++k) map[(uint8_t) a[k]] = (int8_t) k;
+        map[(uint8_t) '-'] = 62;  // base64url
+        map[(uint8_t) '_'] = 63;
+        init = true;
+    }
+    std::string out;
+    out.reserve(in.size() * 3 / 4);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        const int v = map[c];
+        if (v < 0) {
+            if (std::isspace(c)) continue;
+            throw std::runtime_error("invalid base64 in image data");
+        }
+        acc = (acc << 6) | (uint32_t) v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((char) ((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// Images of an OpenAI-style message list, in order: content items {"type":"image_url","image_url":{"url":...}} or
+// {"type":"image","image":...}, as data: URLs (or bare base64). Remote URLs are refused: klein does not fetch.
+std::vector<ImageRGB> extract_images(const json& messages) {
+    std::vector<ImageRGB> out;
+    if (!messages.is_array()) return out;
+    for (const auto& m : messages) {
+        if (!m.is_object() || !m.contains("content") || !m["content"].is_array()) continue;
+        for (const auto& item : m["content"]) {
+            if (!item.is_object()) continue;
+            std::string url;
+            if (item.contains("image_url")) {
+                const auto& iu = item["image_url"];
+                url = iu.is_string() ? iu.get<std::string>() : (iu.is_object() && iu.contains("url") ? iu["url"].get<std::string>() : "");
+            } else if (item.contains("image") && item["image"].is_string()) {
+                url = item["image"].get<std::string>();
+            } else {
+                continue;
+            }
+            std::string b64 = url;
+            if (url.rfind("data:", 0) == 0) {
+                const size_t comma = url.find(',');
+                if (comma == std::string::npos || url.substr(0, comma).find(";base64") == std::string::npos)
+                    throw std::runtime_error("image data URLs must be base64-encoded");
+                b64 = url.substr(comma + 1);
+            } else if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+                throw std::runtime_error("image URLs are not fetched; send the image as a data: URL (base64)");
+            }
+            const std::string bytes = base64_decode(b64);
+            out.push_back(decode_image((const uint8_t*) bytes.data(), bytes.size()));
+        }
+    }
+    return out;
+}
+
 GenResult run_generation(Engine& engine, std::mutex& mutex, const std::vector<int32_t>& tokens,
                          int n_predict, const SamplerParams& sp, const std::vector<std::string>& stops,
-                         const std::function<bool(const std::string&)>& emit) {
+                         const std::function<bool(const std::string&)>& emit,
+                         const std::vector<ImageRGB>& images_rgb = {}) {
     GenResult result;
     std::lock_guard<std::mutex> lock(mutex);
+    std::vector<PromptImage> images;
+    for (const ImageRGB& im : images_rgb) images.push_back(engine.encode_image(im));
     Sampler sampler(sp);
     StopBuffer buffer(stops);
     bool ok = true;
@@ -362,7 +433,7 @@ GenResult run_generation(Engine& engine, std::mutex& mutex, const std::vector<in
         result.text += text;
         if (!emit(text)) ok = false;
     };
-    result.stats = engine.generate(tokens, n_predict, sampler, [&](int32_t token) -> bool {
+    result.stats = engine.generate(tokens, images, n_predict, sampler, [&](int32_t token) -> bool {
         const Tokenizer& tok = engine.tokenizer();
         if (tok.is_eog(token)) {
             result.hit_eog = true;
@@ -419,6 +490,7 @@ struct StreamReq {
     bool thinking_open = true;
     bool include_usage = false;
     json tools;
+    std::vector<ImageRGB> images;
 };
 
 void serve_stream(const StreamReq& st, httplib::DataSink& sink) {
@@ -502,7 +574,7 @@ void serve_stream(const StreamReq& st, httplib::DataSink& sink) {
     GenResult result;
     if (write_ok) {
         try {
-            result = run_generation(*st.engine, *st.mutex, st.tokens, st.n_predict, st.sp, st.stops, emit);
+            result = run_generation(*st.engine, *st.mutex, st.tokens, st.n_predict, st.sp, st.stops, emit, st.images);
         } catch (const std::exception& e) {
             result.write_failed = true;
             if (write_ok) {
@@ -567,7 +639,7 @@ void serve_stream(const StreamReq& st, httplib::DataSink& sink) {
     if (st.include_usage && write_ok) {
         json obj = base();
         obj["choices"] = json::array();
-        obj["usage"] = make_usage(result.generated, (int) st.tokens.size());
+        obj["usage"] = make_usage(result.generated, std::max((int) st.tokens.size(), result.stats.n_prompt_total));
         if (!send(obj)) write_ok = false;
     }
 
@@ -625,6 +697,7 @@ int run_server(Engine& engine, const ServerOptions& opt) {
         model["object"] = "model";
         model["owned_by"] = "klein";
         model["context_length"] = engine.n_ctx();
+        model["modalities"] = engine.has_vision() ? json::array({"text", "image"}) : json::array({"text"});
         json out;
         out["object"] = "list";
         out["data"] = json::array({model});
@@ -715,6 +788,18 @@ int run_server(Engine& engine, const ServerOptions& opt) {
             return;
         }
 
+        std::vector<ImageRGB> images;
+        try {
+            images = extract_images(messages);
+        } catch (const std::exception& e) {
+            send_error(res, 400, e.what());
+            return;
+        }
+        if (!images.empty() && !engine.has_vision()) {
+            send_error(res, 400, "this model was started without a vision encoder; restart klein serve with --mmproj FILE");
+            return;
+        }
+
         std::vector<int32_t> tokens = engine.tokenizer().encode(prompt, true);
         const int fallback = opt.default_max_tokens >= 0 ? opt.default_max_tokens : engine.n_ctx() - (int) tokens.size();
         const int n_predict = resolve_max_tokens(body, (int) tokens.size(), engine.n_ctx(), fallback, err);
@@ -740,6 +825,7 @@ int run_server(Engine& engine, const ServerOptions& opt) {
             st->thinking_open = enable_thinking;
             st->include_usage = include_usage;
             st->tools = tools;
+            st->images = std::move(images);
             res.set_chunked_content_provider(
                 "text/event-stream", [st](size_t, httplib::DataSink& sink) -> bool {
                     serve_stream(*st, sink);
@@ -751,7 +837,7 @@ int run_server(Engine& engine, const ServerOptions& opt) {
         GenResult result;
         try {
             result = run_generation(engine, generation_mutex, tokens, n_predict, sp, stops,
-                                    [](const std::string&) { return true; });
+                                    [](const std::string&) { return true; }, images);
         } catch (const std::exception& e) {
             send_error(res, 500, e.what(), "server_error");
             return;
@@ -782,7 +868,7 @@ int run_server(Engine& engine, const ServerOptions& opt) {
         out["created"] = (long long) std::time(nullptr);
         out["model"] = opt.model_name;
         out["choices"] = json::array({choice});
-        out["usage"] = make_usage(result.generated, (int) tokens.size());
+        out["usage"] = make_usage(result.generated, std::max((int) tokens.size(), result.stats.n_prompt_total));
         out["timings"] = make_timings(result.stats, result.generated);
         res.set_content(out.dump(), "application/json");
 
@@ -869,7 +955,7 @@ int run_server(Engine& engine, const ServerOptions& opt) {
         out["created"] = (long long) std::time(nullptr);
         out["model"] = opt.model_name;
         out["choices"] = json::array({choice});
-        out["usage"] = make_usage(result.generated, (int) tokens.size());
+        out["usage"] = make_usage(result.generated, std::max((int) tokens.size(), result.stats.n_prompt_total));
         out["timings"] = make_timings(result.stats, result.generated);
         res.set_content(out.dump(), "application/json");
 

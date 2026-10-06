@@ -13,7 +13,8 @@ namespace klein {
 
 // Inputs of one forward pass over `n_tokens` consecutive positions starting at `pos0` (single sequence).
 struct FwdInputs {
-    ggml_tensor* tokens = nullptr;   // I32 [n_tokens]
+    ggml_tensor* tokens = nullptr;   // I32 [n_tokens] (token input)
+    ggml_tensor* embd = nullptr;     // F32 [n_embd, n_tokens] (embedding input, e.g. image cells)
     ggml_tensor* pos = nullptr;      // I32 [4 * n_tokens], M-RoPE sections: [p..., p..., p..., 0...]
     ggml_tensor* kv_idx = nullptr;   // I64 [n_tokens], KV cells written (= positions)
     ggml_tensor* mask = nullptr;     // F16 [n_kv, n_tokens], causal mask
@@ -29,12 +30,13 @@ struct FwdGraph {
 };
 
 // Main model: embeddings -> 64 hybrid layers -> final norm (stored into State::hidden) -> LM head.
-FwdGraph build_main_graph(ggml_context* ctx, const Model& m, const State& st, int n_tokens, int n_kv, int n_out);
+// embd_in: the pass takes embedding rows (FwdInputs::embd) instead of token ids.
+FwdGraph build_main_graph(ggml_context* ctx, const Model& m, const State& st, int n_tokens, int n_kv, int n_out, bool embd_in = false);
 
 // MTP head over `n_tokens` positions: input token embeddings + hidden states from `h_src` (a view of
 // [n_embd, n_tokens]). Writes its own final-norm hidden states to `h_dst` (may be nullptr).
 FwdGraph build_mtp_graph(ggml_context* ctx, const Model& m, const State& st, int n_tokens, int n_kv, int n_out,
-                         ggml_tensor* h_src, ggml_tensor* h_dst);
+                         ggml_tensor* h_src, ggml_tensor* h_dst, bool embd_in = false);
 
 // KV view length used for a pass ending at position `n_past_after` (rounded up so graph shapes repeat).
 int padded_n_kv(int n_past_after, int n_ctx);

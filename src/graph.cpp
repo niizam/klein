@@ -43,10 +43,16 @@ struct Builder {
         return ggml_scale(ctx, ggml_rms_norm(ctx, x, hp.rms_eps / n), 1.0f / std::sqrt(n));
     }
 
-    void make_inputs(bool need_mask) {
-        in.tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-        ggml_set_name(in.tokens, "inp_tokens");
-        ggml_set_input(in.tokens);
+    void make_inputs(bool need_mask, bool embd_in) {
+        if (embd_in) {
+            in.embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, n_tokens);
+            ggml_set_name(in.embd, "inp_embd");
+            ggml_set_input(in.embd);
+        } else {
+            in.tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+            ggml_set_name(in.tokens, "inp_tokens");
+            ggml_set_input(in.tokens);
+        }
         in.pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) n_tokens * 4);
         ggml_set_name(in.pos, "inp_pos");
         ggml_set_input(in.pos);
@@ -206,10 +212,10 @@ struct Builder {
 
 }  // namespace
 
-FwdGraph build_main_graph(ggml_context* ctx, const Model& m, const State& st, int n_tokens, int n_kv, int n_out) {
+FwdGraph build_main_graph(ggml_context* ctx, const Model& m, const State& st, int n_tokens, int n_kv, int n_out, bool embd_in) {
     Builder b{ctx, m, st, m.hp, ggml_new_graph_custom(ctx, 16384, false), {}, n_tokens, n_kv};
-    b.make_inputs(true);
-    ggml_tensor* x = ggml_get_rows(ctx, m.tok_embd, b.in.tokens);
+    b.make_inputs(true, embd_in);
+    ggml_tensor* x = embd_in ? b.in.embd : ggml_get_rows(ctx, m.tok_embd, b.in.tokens);
     for (int il = 0; il < m.hp.n_layer; ++il) x = b.block(m.layers[il], il, x, m.hp.is_recurrent(il));
     ggml_tensor* h = b.rms(x, m.output_norm);
     ggml_tensor* hdst = ggml_view_2d(ctx, st.hidden(), m.hp.n_embd, n_tokens, st.hidden()->nb[1], 0);
@@ -231,13 +237,13 @@ FwdGraph build_main_graph(ggml_context* ctx, const Model& m, const State& st, in
 }
 
 FwdGraph build_mtp_graph(ggml_context* ctx, const Model& m, const State& st, int n_tokens, int n_kv, int n_out,
-                         ggml_tensor* h_src, ggml_tensor* h_dst) {
+                         ggml_tensor* h_src, ggml_tensor* h_dst, bool embd_in) {
     KLEIN_ASSERT(m.has_mtp());
     const Layer& L = m.mtp_layer();
     const int il = m.hp.n_layer;
     Builder b{ctx, m, st, m.hp, ggml_new_graph_custom(ctx, 2048, false), {}, n_tokens, n_kv};
-    b.make_inputs(true);
-    ggml_tensor* e = b.rms(ggml_get_rows(ctx, m.tok_embd, b.in.tokens), L.enorm);
+    b.make_inputs(true, embd_in);
+    ggml_tensor* e = b.rms(embd_in ? b.in.embd : ggml_get_rows(ctx, m.tok_embd, b.in.tokens), L.enorm);
     ggml_tensor* h = b.rms(h_src, L.hnorm);
     ggml_tensor* x = ggml_mul_mat(ctx, L.eh_proj, ggml_concat(ctx, e, h, 0));
     x = b.block(L, il, x, false);

@@ -40,8 +40,10 @@ add_library(klein_core STATIC
     src/engine.cpp
     src/transcode.cpp
     src/chat.cpp
-    src/server.cpp)
-target_include_directories(klein_core PUBLIC src third_party/json third_party/httplib)
+    src/server.cpp
+    src/image.cpp
+    src/vision.cpp)
+target_include_directories(klein_core PUBLIC src third_party/json third_party/httplib third_party/stb)
 
 # The chat page (src/web/index.html) is compiled into the binary and served at "/".
 include(cmake/embed.cmake)
